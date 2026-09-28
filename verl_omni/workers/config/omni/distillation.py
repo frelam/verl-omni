@@ -19,6 +19,8 @@ path about (a) the ``vllm_omni`` rollout engine and (b) the hidden-state
 top-k logprobs and add ``kd_temperature``.
 """
 
+import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +28,9 @@ from verl.trainer.distillation.losses import DistillationLossSettings
 from verl.workers.config import DistillationLossConfig, DistillationTeacherModelConfig
 
 __all__ = ["OmniDistillationTeacherModelConfig", "OmniDistillationLossConfig"]
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Loss modes that consume per-position teacher hidden states.
 HIDDEN_STATE_LOSS_MODES = ("nitrobrew", "nitrobrew_reverse_kl")
@@ -56,6 +61,20 @@ class OmniDistillationTeacherModelConfig(DistillationTeacherModelConfig):
                 f"({topk}) to enable distillation loss computation."
             )
         engine_kwargs["vllm_omni"] = omni_engine_kwargs
+
+
+    def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+        super().validate_and_prepare_for_distillation(use_topk, topk)
+        if self.inference.enable_prefix_caching:
+            logger.warning(
+                "Force-disabling prefix caching for teacher '%s': hidden-state capture "
+                "assumes the prefill covers the full sequence; cache hits would return "
+                "hidden states for the non-cached suffix only.",
+                self.key,
+            )
+        # `enable_prefix_caching` is frozen in verl's BaseConfig after the dataclass
+        # is constructed; bypass via object.__setattr__.
+        object.__setattr__(self.inference, "enable_prefix_caching", False)
 
 
 @dataclass

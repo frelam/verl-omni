@@ -35,6 +35,7 @@ from verl_omni.trainer.distillation.nitrobrew_loss import (
     _chunked_reverse_kl_forward,
     _NitrobrewKL,
     _NitrobrewReverseKL,
+    _topk_overlap_diag,
     compute_nitrobrew_multi_kl,
     compute_nitrobrew_multi_reverse_kl,
 )
@@ -58,6 +59,14 @@ def _naive_reverse_kl(z, w, s, temperature=1.0):
     log_ps = F.log_softmax(s, dim=-1)
     ps = log_ps.exp()
     return (ps * (log_ps - log_pt)).sum(dim=-1)
+
+
+def _naive_topk_overlap(z, w, s, k, temperature=1.0):
+    """Per-row |teacher top-k ∩ student top-k| on materialized logits."""
+    zt = (z @ w.T).float() / temperature
+    t_ids = zt.topk(k, dim=1).indices
+    s_ids = s.float().topk(k, dim=1).indices
+    return (t_ids.unsqueeze(-1) == s_ids.unsqueeze(-2)).any(dim=-1).sum(dim=-1)
 
 
 def _make_inputs(seed=0, n=4, v=32, d=8):
@@ -111,10 +120,70 @@ class TestSingleTeacher:
         assert torch.allclose(s_chunked.grad, s_naive.grad, atol=1e-5, rtol=1e-4)
 
 
+class TestTopkOverlapDiag:
+    def test_forward_kl_diag_matches_naive(self):
+        z, w, s = _make_inputs(seed=12, n=6, v=48)
+        kl, _, _, rows, overlap = _chunked_kl_forward(z, w, s, chunk_V=8, diag_topk=4)
+        assert torch.equal(rows, torch.arange(6))
+        assert torch.equal(overlap, _naive_topk_overlap(z, w, s, 4))
+        # diagnostics must not perturb the KL values
+        kl_plain, _, _ = _chunked_kl_forward(z, w, s, chunk_V=8)
+        assert torch.equal(kl, kl_plain)
+
+    def test_reverse_kl_diag_matches_naive(self):
+        z, w, s = _make_inputs(seed=13, n=6, v=48)
+        res = _chunked_reverse_kl_forward(z, w, s, chunk_V=8, diag_topk=4)
+        assert len(res) == 5
+        rows, overlap = res[-2], res[-1]
+        assert torch.equal(rows, torch.arange(6))
+        assert torch.equal(overlap, _naive_topk_overlap(z, w, s, 4))
+
+    def test_no_diag_keeps_three_tuple(self):
+        z, w, s = _make_inputs()
+        assert len(_chunked_kl_forward(z, w, s, chunk_V=8)) == 3
+        assert len(_chunked_reverse_kl_forward(z, w, s, chunk_V=8)) == 3
+
+    def test_zero_topk_disables_diag(self):
+        # topk=0 must behave like None: 3-tuple, no extra vocab scan, no crash.
+        z, w, s = _make_inputs()
+        assert len(_chunked_kl_forward(z, w, s, chunk_V=8, diag_topk=0)) == 3
+        assert len(_chunked_reverse_kl_forward(z, w, s, chunk_V=8, diag_topk=0)) == 3
+
+    def test_subsampling_stride(self):
+        z, w, s = _make_inputs(seed=14, n=8, v=32)
+        rows, overlap = _topk_overlap_diag(z.float(), w.float(), s, diag_topk=4, diag_max_rows=4)
+        assert torch.equal(rows, torch.tensor([0, 2, 4, 6]))
+        assert torch.equal(overlap, _naive_topk_overlap(z, w, s, 4)[rows])
+
+    def test_autograd_with_diag(self):
+        z, w, s = _make_inputs(seed=15)
+        s_chunked = s.clone().requires_grad_(True)
+        kl, rows, overlap = _NitrobrewKL.apply(z, w, s_chunked, 4, 1.0, None, 4)
+        assert torch.equal(rows, torch.arange(4))
+        assert not rows.requires_grad and not overlap.requires_grad
+        kl.sum().backward()
+
+        s_naive = s.clone().requires_grad_(True)
+        _naive_forward_kl(z, w, s_naive).sum().backward()
+        assert torch.allclose(s_chunked.grad, s_naive.grad, atol=1e-5, rtol=1e-4)
+
+    def test_autograd_reverse_with_diag(self):
+        z, w, s = _make_inputs(seed=17)
+        s_chunked = s.clone().requires_grad_(True)
+        res = _NitrobrewReverseKL.apply(z, w, s_chunked, 4, 1.0, 4)
+        assert len(res) == 3
+        res[0].sum().backward()
+
+        s_naive = s.clone().requires_grad_(True)
+        _naive_reverse_kl(z, w, s_naive).sum().backward()
+        assert torch.allclose(s_chunked.grad, s_naive.grad, atol=1e-5, rtol=1e-4)
+
+
 class _LossConfig:
-    def __init__(self, temperature=1.0, log_prob_min_clamp=-10.0):
+    def __init__(self, temperature=1.0, log_prob_min_clamp=-10.0, topk=None):
         self.kd_temperature = temperature
         self.log_prob_min_clamp = log_prob_min_clamp
+        self.topk = topk
 
 
 class TestMultiTeacherGrouping:
@@ -167,3 +236,32 @@ class TestMultiTeacherGrouping:
         out = compute_nitrobrew_multi_kl(s[None], z[None], key_ids, {0: w}, cfg, "thd")
         expected = _naive_forward_kl(z, w, s, temperature=0.7)
         assert torch.allclose(out["distillation_losses"][0], expected, atol=1e-5, rtol=1e-4)
+
+    def test_overlap_counts_multi_teacher(self):
+        z, w, s = _make_inputs(seed=16, n=4, v=48)
+        w0, w1 = w, w * 0.9
+        key_ids = torch.tensor([0, 0, 1, 1])
+        cfg = type("C", (), {"distillation_loss": _LossConfig(topk=4)})()
+        out = compute_nitrobrew_multi_kl(s[None], z[None], key_ids, {0: w0, 1: w1}, cfg, "thd")
+        expected = torch.cat(
+            [
+                _naive_topk_overlap(z[:2], w0, s[:2], 4),
+                _naive_topk_overlap(z[2:], w1, s[2:], 4),
+            ]
+        )
+        assert torch.equal(out["overlap_counts"][0], expected.float())
+
+    def test_no_diag_omits_overlap_counts(self):
+        z, w, s = _make_inputs(seed=18, n=4)
+        key_ids = torch.zeros(4, dtype=torch.long)
+        out = compute_nitrobrew_multi_kl(s[None], z[None], key_ids, {0: w}, self._config(), "thd")
+        assert "overlap_counts" not in out
+
+    def test_zero_topk_omits_overlap_counts(self):
+        # Regression: topk=0 must disable the diagnostic instead of crashing.
+        z, w, s = _make_inputs(seed=19, n=4)
+        key_ids = torch.zeros(4, dtype=torch.long)
+        cfg = type("C", (), {"distillation_loss": _LossConfig(topk=0)})()
+        out = compute_nitrobrew_multi_kl(s[None], z[None], key_ids, {0: w}, cfg, "thd")
+        assert "overlap_counts" not in out
+        assert not torch.isnan(out["distillation_losses"]).any()

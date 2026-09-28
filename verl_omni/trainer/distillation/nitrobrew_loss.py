@@ -30,6 +30,49 @@ from verl.workers.config import DistillationConfig
 
 _CHUNK_V: int = 1024
 
+# Overlap diagnostics: subsample at most this many token rows for the teacher
+# top-k vs student top-k comparison (see `_topk_overlap_diag`).
+_DIAG_MAX_ROWS: int = 1024
+
+
+def _topk_overlap_diag(
+    z_f: torch.Tensor,  # (N, D_t) float32, temperature-scaled
+    W_f: torch.Tensor,  # (V, D_t) float32
+    student_logits: torch.Tensor,  # (N, V), raw (unscaled) logits
+    diag_topk: int,
+    diag_max_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Teacher/student top-k overlap diagnostic on stride-subsampled rows.
+
+    Runs a lightweight second vocab scan for at most ``diag_max_rows`` rows
+    (stride-subsampled), tracking a running top-k of the teacher logits per
+    chunk, and compares against the student's top-k ids. Costs a
+    [R, D] @ [D, V] matmul fraction (R << N) plus one student top-k, and is
+    disconnected from the KL computation and its autograd graph.
+
+    Returns (rows, overlap_count): row indices [R] and per-row overlap counts
+    [R] (long), both on ``z_f``'s device.
+    """
+    N, V = student_logits.shape
+    device = z_f.device
+    k = min(diag_topk, V)
+    stride = max(1, (N + diag_max_rows - 1) // diag_max_rows)
+    rows = torch.arange(0, N, stride, device=device)
+
+    z_r = z_f[rows]
+    s_topk_ids = student_logits[rows].topk(k, dim=1).indices
+
+    run_vals = torch.full((rows.numel(), k), float("-inf"), dtype=torch.float32, device=device)
+    run_ids = torch.zeros((rows.numel(), k), dtype=torch.long, device=device)
+    for v in range(0, V, _CHUNK_V):
+        zt = z_r @ W_f[v : v + _CHUNK_V].T
+        vals, ids = zt.topk(k, dim=1)
+        run_vals, sel = torch.cat([run_vals, vals], dim=1).topk(k, dim=1)
+        run_ids = torch.cat([run_ids, ids + v], dim=1).gather(1, sel)
+
+    overlap_count = (run_ids.unsqueeze(-1) == s_topk_ids.unsqueeze(-2)).any(dim=-1).sum(dim=-1)
+    return rows, overlap_count
+
 
 # ---------------------------------------------------------------------------
 # Forward KL: KL(p_T || p_S)
@@ -79,8 +122,14 @@ def _chunked_kl_forward(
     chunk_V: int = _CHUNK_V,
     temperature: float = 1.0,
     log_prob_min_clamp: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Single-pass chunked forward. Returns (kl, t_lse, s_lse) all (N,) float32."""
+    diag_topk: int | None = None,
+    diag_max_rows: int = _DIAG_MAX_ROWS,
+) -> tuple:
+    """Single-pass chunked forward. Returns (kl, t_lse, s_lse) all (N,) float32.
+
+    With ``diag_topk`` set, additionally returns (rows, overlap_count) from
+    `_topk_overlap_diag`.
+    """
     N = z.shape[0]
     V = W.shape[0]
     device = z.device
@@ -121,7 +170,10 @@ def _chunked_kl_forward(
 
     t_lse = mt + st.log()
     kl = tt / st - t_lse - ut / st + s_lse
-    return kl, t_lse, s_lse
+    if not diag_topk:
+        return kl, t_lse, s_lse
+    diag_rows, diag_overlap = _topk_overlap_diag(z_f, W_f, student_logits, diag_topk, diag_max_rows)
+    return kl, t_lse, s_lse, diag_rows, diag_overlap
 
 
 # ---------------------------------------------------------------------------
@@ -153,22 +205,37 @@ class _NitrobrewKL(torch.autograd.Function):
     """KL(p_T || p_S) with chunked forward and backward over vocab axis."""
 
     @staticmethod
-    def forward(ctx, z, W, student_logits, chunk_V, temperature=1.0, log_prob_min_clamp=None):
-        kl, t_lse, s_lse = _chunked_kl_forward(
+    def forward(
+        ctx,
+        z,
+        W,
+        student_logits,
+        chunk_V,
+        temperature=1.0,
+        log_prob_min_clamp=None,
+        diag_topk=None,
+        diag_max_rows=_DIAG_MAX_ROWS,
+    ):
+        kl, t_lse, s_lse, *diag = _chunked_kl_forward(
             z,
             W,
             student_logits,
             chunk_V,
             temperature,
             log_prob_min_clamp,
+            diag_topk,
+            diag_max_rows,
         )
         ctx.save_for_backward(z, W, student_logits, t_lse, s_lse)
         ctx.chunk_V = chunk_V
         ctx.temperature = temperature
+        if diag:
+            ctx.mark_non_differentiable(*diag)
+            return (kl, *diag)
         return kl
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, *_diag_grads):
         z, W, student_logits, t_lse, s_lse = ctx.saved_tensors
         chunk_V = ctx.chunk_V
         temperature = ctx.temperature
@@ -199,7 +266,7 @@ class _NitrobrewKL(torch.autograd.Function):
         if inv_T != 1.0:
             grad_s = grad_s * inv_T
 
-        return None, None, grad_s.to(student_logits.dtype), None, None, None
+        return None, None, grad_s.to(student_logits.dtype), None, None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +305,14 @@ def _chunked_reverse_kl_forward(
     student_logits: torch.Tensor,  # (N, V)
     chunk_V: int = _CHUNK_V,
     temperature: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Chunked reverse KL forward. Returns (kl, t_lse, s_lse) all (N,) float32."""
+    diag_topk: int | None = None,
+    diag_max_rows: int = _DIAG_MAX_ROWS,
+) -> tuple:
+    """Chunked reverse KL forward. Returns (kl, t_lse, s_lse) all (N,) float32.
+
+    With ``diag_topk`` set, additionally returns (rows, overlap_count) from
+    `_topk_overlap_diag`.
+    """
     N = z.shape[0]
     V = W.shape[0]
     device = z.device
@@ -275,7 +348,10 @@ def _chunked_reverse_kl_forward(
 
     t_lse = mt + st.log()
     kl = et - ut - s_lse + t_lse
-    return kl, t_lse, s_lse
+    if not diag_topk:
+        return kl, t_lse, s_lse
+    diag_rows, diag_overlap = _topk_overlap_diag(z_f, W_f, student_logits, diag_topk, diag_max_rows)
+    return kl, t_lse, s_lse, diag_rows, diag_overlap
 
 
 def _rev_bwd_chunk(
@@ -299,15 +375,20 @@ class _NitrobrewReverseKL(torch.autograd.Function):
     """KL(p_S || p_T) with chunked forward and backward over vocab axis."""
 
     @staticmethod
-    def forward(ctx, z, W, student_logits, chunk_V, temperature=1.0):
-        kl, t_lse, s_lse = _chunked_reverse_kl_forward(z, W, student_logits, chunk_V, temperature)
+    def forward(ctx, z, W, student_logits, chunk_V, temperature=1.0, diag_topk=None, diag_max_rows=_DIAG_MAX_ROWS):
+        kl, t_lse, s_lse, *diag = _chunked_reverse_kl_forward(
+            z, W, student_logits, chunk_V, temperature, diag_topk, diag_max_rows
+        )
         ctx.save_for_backward(z, W, student_logits, t_lse, s_lse, kl)
         ctx.chunk_V = chunk_V
         ctx.temperature = temperature
+        if diag:
+            ctx.mark_non_differentiable(*diag)
+            return (kl, *diag)
         return kl
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, *_diag_grads):
         z, W, student_logits, t_lse, s_lse, kl = ctx.saved_tensors
         chunk_V = ctx.chunk_V
         temperature = ctx.temperature
@@ -338,7 +419,7 @@ class _NitrobrewReverseKL(torch.autograd.Function):
         if inv_T != 1.0:
             grad_s = grad_s * inv_T
 
-        return None, None, grad_s.to(student_logits.dtype), None, None
+        return None, None, grad_s.to(student_logits.dtype), None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +486,9 @@ def _grouped_nitrobrew_kl(
         reverse: use KL(p_S || p_T) instead of KL(p_T || p_S).
 
     Returns:
-        {"distillation_losses": [1, N] float32 per-token KL}.
+        {"distillation_losses": [1, N] float32 per-token KL}. With diagnostics
+        enabled (``distillation_loss.topk`` set), additionally
+        {"overlap_counts": [1, N] float32, -1 on non-sampled rows}.
     """
     z, T_sp = _unpack_hidden_states(teacher_hidden_states, student_logits)
     z_flat = z.view(T_sp, -1)  # [T, D]
@@ -414,6 +497,11 @@ def _grouped_nitrobrew_kl(
 
     loss_config = config.distillation_loss
     out = torch.full((T_sp,), float("nan"), dtype=torch.float32, device=device)
+
+    # `topk` defaults to 128 in verl's DistillationLossConfig, so the overlap
+    # diagnostic is ON unless explicitly set to null/0 (normalized to None here).
+    diag_topk = getattr(loss_config, "topk", None) or None
+    diag_counts = torch.full((T_sp,), -1.0, dtype=torch.float32, device=device) if diag_topk else None
 
     key_ids = teacher_key_ids
     if key_ids.dim() == 2:  # [bsz, S] -> flat [T]
@@ -426,23 +514,33 @@ def _grouped_nitrobrew_kl(
         mask = key_ids == int(kid)
         if not mask.any():
             continue
+        group_rows = mask.nonzero(as_tuple=True)[0]
         if reverse:
-            kl = fn.apply(
+            res = fn.apply(
                 z_flat[mask],
                 W.to(device=device),
                 s_flat[mask],
                 _CHUNK_V,
                 loss_config.kd_temperature,
+                diag_topk,
+                _DIAG_MAX_ROWS,
             )
         else:
-            kl = fn.apply(
+            res = fn.apply(
                 z_flat[mask],
                 W.to(device=device),
                 s_flat[mask],
                 _CHUNK_V,
                 loss_config.kd_temperature,
                 loss_config.log_prob_min_clamp,
+                diag_topk,
+                _DIAG_MAX_ROWS,
             )
+        if diag_topk is not None:
+            kl, diag_local_rows, diag_overlap = res
+            diag_counts[group_rows[diag_local_rows]] = diag_overlap.float()
+        else:
+            kl = res
         out[mask] = kl
 
     missing = torch.isnan(out).sum().item()
@@ -451,7 +549,10 @@ def _grouped_nitrobrew_kl(
             f"{missing}/{T_sp} tokens had no registered teacher unembedding; "
             f"teacher_key_to_id mapping and teacher_unembeds must cover all routes."
         )
-    return {"distillation_losses": out.view(1, T_sp)}
+    result = {"distillation_losses": out.view(1, T_sp)}
+    if diag_counts is not None:
+        result["overlap_counts"] = diag_counts.view(1, T_sp)
+    return result
 
 
 def _flatten_teacher_key_ids(key_ids: torch.Tensor, teacher_hidden_states: torch.Tensor) -> torch.Tensor:

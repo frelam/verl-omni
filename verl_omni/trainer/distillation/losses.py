@@ -72,7 +72,22 @@ def compute_nitrobrew_loss_aggregate(
     # clamped tokens. Floor at zero to prevent negative losses acting as reward.
     distillation_losses = distillation_losses.clamp_min(0.0)
 
-    return distillation_losses, {}
+    # Teacher/student top-k overlap diagnostic (stride-subsampled rows; -1
+    # marks rows not measured). Mirrors verl's `distillation/overlap_ratio`
+    # from the top-k OPD path.
+    metrics = {}
+    overlap_counts = model_output.get("overlap_counts")
+    if overlap_counts is not None:
+        k = distillation_config.distillation_loss.topk
+        assert k is not None
+        overlap_counts = no_padding_2_padding(overlap_counts, data)
+        measured = response_mask_bool & (overlap_counts >= 0)
+        if measured.any():
+            metrics["distillation/overlap_ratio"] = (overlap_counts[measured].float().mean() / k).item()
+        else:
+            metrics["distillation/overlap_ratio"] = 0.0
+
+    return distillation_losses, metrics
 
 
 # ---------------------------------------------------------------------------

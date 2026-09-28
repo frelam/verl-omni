@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU tests for the omni hidden-state distillation loss dispatch (Task 3)."""
 
+import pytest
 import torch
 from tensordict import NonTensorData, TensorDict
 
@@ -112,3 +113,42 @@ class TestAggregateRegistered:
             settings = get_distillation_loss_settings(mode)
             assert callable(fn)
             assert set(settings.names) == set(HIDDEN_STATE_LOSS_MODES)
+
+
+class TestNitrobrewAggregateOverlapMetric:
+    """The nitrobrew aggregate must emit distillation/overlap_ratio from the
+    kernel's stride-subsampled overlap_counts (-1 marks non-sampled rows)."""
+
+    def _data(self):
+        # bsz=1, prompt_len=3, resp_len=4 -> total_nnz=7.
+        return TensorDict(
+            {
+                "prompts": torch.zeros(1, 3, dtype=torch.long),
+                "responses": torch.zeros(1, 4, dtype=torch.long),
+                "attention_mask": torch.ones(1, 7, dtype=torch.long),
+                "response_mask": torch.ones(1, 4, dtype=torch.bool),
+            },
+            batch_size=[1],
+        )
+
+    def _distill_config(self, topk=4):
+        return type("D", (), {"distillation_loss": type("L", (), {"topk": topk})()})()
+
+    def test_overlap_ratio_emitted(self):
+        from verl_omni.trainer.distillation.losses import compute_nitrobrew_loss_aggregate
+
+        # response slice covers flat indices 2..5 -> counts 1, 2, 0, 4.
+        model_output = {
+            "distillation_losses": torch.arange(7, dtype=torch.float32),
+            "overlap_counts": torch.tensor([-1.0, -1.0, 1.0, 2.0, 0.0, 4.0, -1.0]),
+        }
+        losses, metrics = compute_nitrobrew_loss_aggregate(None, self._distill_config(topk=4), model_output, self._data())
+        assert metrics["distillation/overlap_ratio"] == pytest.approx((1 + 2 + 0 + 4) / 4 / 4)
+        assert losses.shape == (1, 4)
+
+    def test_no_overlap_counts_yields_empty_metrics(self):
+        from verl_omni.trainer.distillation.losses import compute_nitrobrew_loss_aggregate
+
+        model_output = {"distillation_losses": torch.arange(7, dtype=torch.float32)}
+        losses, metrics = compute_nitrobrew_loss_aggregate(None, self._distill_config(), model_output, self._data())
+        assert metrics == {}
