@@ -181,6 +181,81 @@ def test_v1_adapter_forwards_qwen3_omni_media_metadata_to_rope(monkeypatch, has_
         assert configured.second_per_grids is None
 
 
+@pytest.mark.parametrize(
+    "audio_seqlens,row,expected_row",
+    [
+        # Image sample whose response emitted a full audio segment; no real audio.
+        (None, [1, 101, 2, 110, 103, 103, 105, 3], [1, 101, 2, 0, 0, 0, 0, 3]),
+        # Image sample whose response emitted a lone <|audio_bos|> (no pad/eos).
+        (None, [1, 101, 2, 110, 3], [1, 101, 2, 0, 3]),
+        # Real audio segment stays intact; only the surplus response segment drops.
+        ([7], [1, 110, 103, 103, 105, 2, 110, 103, 105, 3], [1, 110, 103, 103, 105, 2, 0, 0, 0, 3]),
+        # Real audio only, nothing stray: pass through unchanged.
+        ([7], [1, 110, 103, 103, 105, 2], [1, 110, 103, 103, 105, 2]),
+    ],
+)
+def test_get_rope_index_demotes_stray_audio_tokens(monkeypatch, audio_seqlens, row, expected_row):
+    """Stray response-emitted audio specials must not reach HF get_rope_index.
+
+    HF ``get_rope_index`` indexes ``audio_seqlens`` once per ``<|audio_bos|>``
+    segment with no None/length guard, so rollouts that emit audio specials in
+    the response crash position computation (TypeError/IndexError) unless the
+    adapter demotes the surplus tokens to plain text.
+    """
+    pytest.importorskip("transformers")
+    _require_version("transformers", "5.0.0")
+
+    from transformers import AutoConfig
+    from transformers.models.qwen3_omni_moe import Qwen3OmniMoeThinkerForConditionalGeneration
+
+    from verl_omni.pipelines.qwen3_omni.video_processor import Qwen3OmniVideoProcessor
+
+    # 101=<|image_pad|> 103=<|audio_pad|> 105=<|audio_eos|> 110=<|audio_bos|>; 0 is the pad fallback.
+    tokenizer = SimpleNamespace(
+        pad_token_id=0,
+        unk_token_id=None,
+        convert_tokens_to_ids=lambda token: {"<|audio_eos|>": 105}.get(token, 0),
+    )
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    config = SimpleNamespace(
+        thinker_config=SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            audio_start_token_id=110,
+            audio_token_id=103,
+        ),
+        talker_config=SimpleNamespace(vision_start_token_id=104),
+    )
+
+    def _get_rope_index(processor, *, input_ids, attention_mask, **kwargs):
+        processor.received_input_ids = input_ids
+        return torch.zeros((3, *input_ids.shape), dtype=torch.float32), torch.zeros((input_ids.shape[0], 1))
+
+    monkeypatch.setattr(Qwen3OmniVideoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *args, **kwargs: config)
+    monkeypatch.setattr(Qwen3OmniMoeThinkerForConditionalGeneration, "get_rope_index", _get_rope_index)
+
+    configured = Qwen3OmniThinkerAdapter.configure_processor(
+        "/fake/qwen3-omni",
+        SimpleNamespace(trust_remote_code=False),
+    )
+
+    input_ids = torch.tensor([row])
+    seqlens = None if audio_seqlens is None else torch.tensor(audio_seqlens)
+    position_ids, _ = configured.get_rope_index(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        image_grid_thw=torch.tensor([[1, 2, 2]]),
+        audio_seqlens=seqlens,
+    )
+
+    assert processor.received_input_ids.tolist() == [expected_row]
+    if expected_row == row:
+        assert processor.received_input_ids is input_ids
+    # The caller's tensor is never mutated in place (training still uses it).
+    assert input_ids.tolist() == [row]
+    assert position_ids.dtype == torch.long
+
+
 class _FusedMoEExperts(nn.Module):
     """Minimal Qwen3-Omni-style fused expert group.
 

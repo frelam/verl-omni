@@ -25,6 +25,7 @@ import os
 from typing import Any
 
 import numpy as np
+import torch
 
 from verl_omni.pipelines.model_base import OmniModelBase
 
@@ -72,6 +73,9 @@ class Qwen3OmniThinkerAdapter(OmniModelBase):
         ``get_llm_pos_ids_for_vision`` (model methods the omni agent loop
         calls on the processor), and ``dedup_pad_tokens`` (collapses
         consecutive multimodal pad tokens before vLLM-Omni re-expands them).
+        ``get_rope_index`` additionally demotes stray response-emitted audio
+        special tokens to plain-text positions, because HF crashes on audio
+        segments that have no matching ``audio_seqlens`` entry.
 
         Args:
             model_path: Local path to the model checkpoint.
@@ -98,8 +102,79 @@ class Qwen3OmniThinkerAdapter(OmniModelBase):
 
         model_cls = Qwen3OmniMoeThinkerForConditionalGeneration
 
+        def _sanitize_stray_audio_specials(self, input_ids, audio_seqlens):
+            """Demote audio special tokens not backed by a real audio to plain text.
+
+            RL rollouts can emit ``<|audio_bos|>``/``<|audio_pad|>`` in the
+            response; HF ``get_rope_index`` indexes ``audio_seqlens`` once per
+            ``<|audio_bos|>`` segment it finds (no None/length guard), so any
+            segment beyond the real audios must be treated as plain text to
+            keep position computation from crashing. Returns ``input_ids``
+            unchanged when there is nothing to fix; never mutates in place.
+            """
+            if not torch.is_tensor(input_ids):
+                return input_ids
+            audio_bos = getattr(self.config, "audio_start_token_id", None)
+            audio_pad = getattr(self.config, "audio_token_id", None)
+            if audio_bos is None or audio_pad is None:
+                return input_ids
+            tokenizer = getattr(self, "tokenizer", None)
+            audio_eos = None
+            if tokenizer is not None:
+                try:
+                    tid = tokenizer.convert_tokens_to_ids("<|audio_eos|>")
+                    if tid is not None and tid != getattr(tokenizer, "unk_token_id", None):
+                        audio_eos = int(tid)
+                except Exception:
+                    pass
+            special_ids = {int(audio_bos), int(audio_pad)}
+            if audio_eos is not None:
+                special_ids.add(audio_eos)
+            if audio_seqlens is None:
+                n_real = 0
+            elif torch.is_tensor(audio_seqlens):
+                n_real = audio_seqlens.numel()
+            else:
+                n_real = len(audio_seqlens)
+            replacement_id = getattr(tokenizer, "pad_token_id", None) or 0
+
+            rows = input_ids.tolist()
+            n_replaced = 0
+            for row in rows:
+                bos_positions = [i for i, tid in enumerate(row) if tid == audio_bos]
+                if len(bos_positions) <= n_real:
+                    continue
+                if n_real:
+                    # Keep the real segments intact; sanitize from the end of the
+                    # last real segment (its ``<|audio_eos|>``) onward.
+                    last_real_bos, first_stray_bos = bos_positions[n_real - 1], bos_positions[n_real]
+                    eos = next((i for i in range(last_real_bos + 1, first_stray_bos) if row[i] == audio_eos), None)
+                    start = eos + 1 if eos is not None else first_stray_bos
+                else:
+                    start = 0
+                for i in range(start, len(row)):
+                    if row[i] in special_ids:
+                        row[i] = replacement_id
+                        n_replaced += 1
+            if not n_replaced:
+                return input_ids
+            logger.warning(
+                "Demoted %d stray audio special token(s) to pad id %d for RoPE index computation; "
+                "the rollout likely emitted <|audio_bos|>/<|audio_pad|> in the response.",
+                n_replaced,
+                replacement_id,
+            )
+            return torch.tensor(rows, dtype=input_ids.dtype, device=input_ids.device)
+
         # Cast to int64: HF returns float32, FSDP would otherwise bf16-round positions.
         def _get_rope_index_long(self, *args, **kwargs):
+            input_ids = kwargs.get("input_ids", args[0] if args else None)
+            sanitized = _sanitize_stray_audio_specials(self, input_ids, kwargs.get("audio_seqlens"))
+            if sanitized is not input_ids:
+                if "input_ids" in kwargs or not args:
+                    kwargs["input_ids"] = sanitized
+                else:
+                    args = (sanitized, *args[1:])
             vision_position_ids, deltas = model_cls.get_rope_index(self, *args, **kwargs)
             return vision_position_ids.long(), deltas
 
