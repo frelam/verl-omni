@@ -101,6 +101,29 @@ class TestSingleTeacherRouting:
         data = TensorDict({"teacher_hidden_states": hidden}, batch_size=[1])
         ids = _per_token_teacher_key_ids(data, hidden, {"t0": 0})
         assert ids.shape[0] == 4
+        assert ids.abs().sum().item() == 0
+
+
+class TestMultiTeacherRouting:
+    def test_missing_key_ids_raises(self):
+        """Multi-teacher without per-sequence ids must fail loudly, not route to 0."""
+        from verl_omni.trainer.distillation.losses import _per_token_teacher_key_ids
+
+        hidden = torch.randn(1, 4, 8)
+        data = TensorDict({"teacher_hidden_states": hidden}, batch_size=[1])
+        with pytest.raises(KeyError, match="teacher_key_ids"):
+            _per_token_teacher_key_ids(data, hidden, {"t0": 0, "t1": 1})
+
+    def test_per_sequence_ids_expand_over_nested_tokens(self):
+        from verl_omni.trainer.distillation.losses import _per_token_teacher_key_ids
+
+        hidden = torch.nested.nested_tensor([torch.randn(3, 8), torch.randn(2, 8)], layout=torch.jagged)
+        data = TensorDict(
+            {"teacher_hidden_states": hidden, "teacher_key_ids": torch.tensor([1, 0])},
+            batch_size=[2],
+        )
+        ids = _per_token_teacher_key_ids(data, hidden, {"t0": 0, "t1": 1})
+        assert ids.tolist() == [1, 1, 1, 0, 0]
 
 
 class TestAggregateRegistered:

@@ -138,18 +138,23 @@ def _per_token_teacher_key_ids(data, teacher_hidden_states, key_to_id):
     """Build [T] int teacher id per rmpad token.
 
     Single teacher: every token routes to the sole unembedding -> all zeros.
-    Multi teacher: ``data["teacher_key_ids"]`` (per-sequence int ids) is
-    expanded over the jagged token offsets of the hidden tensor so each token
-    is grouped under its originating teacher. If the per-sequence ids are not
-    carried (older recipe), falls back to the single-teacher constant.
+    Multi teacher: ``data["teacher_key_ids"]`` (per-sequence int ids, injected
+    by ``ActorRolloutRefWorker.update_actor`` from the ``teacher_key`` routing
+    column) is expanded over the jagged token offsets of the hidden tensor.
+    Missing ids raise: silently routing every token to teacher 0 would
+    reconstruct teacher logits with the wrong unembedding.
     """
-    multi_teacher = len(key_to_id) > 1
-    per_seq = data.get("teacher_key_ids", None) if multi_teacher else None
-    if per_seq is None:
-        if multi_teacher:
-            logger.warning("multi-teacher hidden OPD without per-token key ids; routing all to id 0")
-        T = hidden_token_count(teacher_hidden_states)
+    T = hidden_token_count(teacher_hidden_states)
+    if len(key_to_id) <= 1:
         return torch.zeros(T, dtype=torch.long, device=teacher_hidden_states.device)
+
+    per_seq = data.get("teacher_key_ids", None)
+    if per_seq is None:
+        raise KeyError(
+            "multi-teacher hidden OPD requires per-sequence 'teacher_key_ids' in the batch; "
+            "ActorRolloutRefWorker.update_actor derives them from the 'teacher_key' routing column - "
+            "check that the nitrobrew agent loop ran and the rollout/trainer verl_omni versions match."
+        )
 
     key_ids = per_seq.to(device=teacher_hidden_states.device, dtype=torch.long)
     if teacher_hidden_states.is_nested:

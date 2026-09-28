@@ -92,3 +92,61 @@ class TestUpdateActorInjection:
         w.update_actor(data)
         assert "teacher_unembeds" not in w.actor.calls[-1]
         assert "teacher_key_to_id" not in w.actor.calls[-1]
+
+
+def _with_routing_column(data, keys: list[str]):
+    from tensordict import NonTensorData, NonTensorStack
+
+    data["teacher_key"] = NonTensorStack.from_list([NonTensorData(k) for k in keys])
+    return data
+
+
+class TestTeacherKeyIdsInjection:
+    def test_multi_teacher_maps_routing_strings(self):
+        from tensordict import TensorDict
+
+        w = _make_worker()
+        w.set_teacher_unembeds({"b": torch.randn(10, 4), "a": torch.randn(10, 4)})
+
+        data = TensorDict({"input_ids": torch.zeros(3, 3, dtype=torch.long)}, batch_size=[3])
+        _with_routing_column(data, ["b", "a", "b"])
+        w.update_actor(data)
+
+        seen = w.actor.calls[-1]
+        assert seen["teacher_key_to_id"] == {"a": 0, "b": 1}
+        assert seen["teacher_key_ids"].tolist() == [1, 0, 1]
+        assert seen["teacher_key_ids"].dtype == torch.long
+
+    def test_multi_teacher_unknown_key_raises(self):
+        from tensordict import TensorDict
+
+        w = _make_worker()
+        w.set_teacher_unembeds({"a": torch.randn(10, 4), "b": torch.randn(10, 4)})
+
+        data = TensorDict({"input_ids": torch.zeros(1, 3, dtype=torch.long)}, batch_size=[1])
+        _with_routing_column(data, ["nope"])
+        with pytest.raises(KeyError, match="nope"):
+            w.update_actor(data)
+
+    def test_multi_teacher_without_routing_column_skips(self):
+        from tensordict import TensorDict
+
+        w = _make_worker()
+        w.set_teacher_unembeds({"a": torch.randn(10, 4), "b": torch.randn(10, 4)})
+
+        data = TensorDict({"input_ids": torch.zeros(2, 3, dtype=torch.long)}, batch_size=[2])
+        w.update_actor(data)
+        assert "teacher_key_ids" not in w.actor.calls[-1]
+
+    def test_single_teacher_ignores_routing_column(self):
+        from tensordict import TensorDict
+
+        w = _make_worker()
+        w.set_teacher_unembeds({"t0": torch.randn(10, 4)})
+
+        # The nitrobrew agent loop stores the placeholder "default" for the
+        # single-teacher case; it must not be mapped (the loss uses id 0).
+        data = TensorDict({"input_ids": torch.zeros(2, 3, dtype=torch.long)}, batch_size=[2])
+        _with_routing_column(data, ["default", "default"])
+        w.update_actor(data)
+        assert "teacher_key_ids" not in w.actor.calls[-1]

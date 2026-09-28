@@ -557,6 +557,30 @@ def build_teacher_training_config(
     return teacher_training_config
 
 
+def _teacher_key_ids_from_routing(data: TensorDict, key_vocab: list[str]) -> Optional[torch.Tensor]:
+    """Map the per-sequence ``teacher_key`` routing strings to int ids.
+
+    The id order matches ``teacher_key_to_id`` (sorted ``key_vocab``) so the
+    nitrobrew loss can group rmpad tokens under their originating teacher's
+    unembedding. Returns None when the batch carries no routing column (older
+    recipes); unknown keys raise because silent misrouting is worse than a
+    loud failure.
+    """
+    if "teacher_key" not in data:
+        return None
+    key_to_id = {key: i for i, key in enumerate(key_vocab)}
+    ids = []
+    for item in data["teacher_key"]:
+        key = item.data if isinstance(item, NonTensorData) else item
+        if key not in key_to_id:
+            raise KeyError(
+                f"teacher_key {key!r} not in teacher key vocab {sorted(key_to_id)}; "
+                "check distillation.teacher_models and the distillation.teacher_key routing column."
+            )
+        ids.append(key_to_id[key])
+    return torch.tensor(ids, dtype=torch.long)
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """Hybrid worker that includes actor model, rollout and optional ref model.
     For standalone actor or rollout, use ActorWorker or BaseRollout respectively.
@@ -930,6 +954,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if getattr(self, "_teacher_unembeds", None):
             data["teacher_unembeds"] = NonTensorData(self._teacher_unembeds)
             data["teacher_key_to_id"] = NonTensorData({key: i for i, key in enumerate(self._teacher_key_vocab)})
+            if len(self._teacher_key_vocab) > 1:
+                # Multi-teacher hidden OPD: the nitrobrew loss routes tokens by
+                # per-sequence int ids; derive them from the routing strings
+                # lifted onto the batch by the nitrobrew agent loop.
+                key_ids = _teacher_key_ids_from_routing(data, self._teacher_key_vocab)
+                if key_ids is not None:
+                    data["teacher_key_ids"] = key_ids
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
