@@ -93,6 +93,89 @@ class TestLogitsProcessorDispatch:
         assert out == "DELEGATED"
 
 
+class TestMegatronDispatch:
+    """config.strategy == 'megatron' must route to the vocab-parallel kernel."""
+
+    def _data(self, with_key_ids=False):
+        fields = {
+            "teacher_hidden_states": torch.randn(1, 4, 8),
+            "teacher_unembeds": NonTensorData({"t0": torch.randn(32, 8)}),
+            "teacher_key_to_id": NonTensorData({"t0": 0}),
+            "local_cp_size": NonTensorData(2),
+        }
+        if with_key_ids:
+            fields["teacher_key_ids"] = torch.tensor([0])
+        return TensorDict(fields, batch_size=[1])
+
+    def test_megatron_strategy_routes_to_megatron_kernel(self, monkeypatch):
+        called = {}
+
+        def fake_megatron_kl(
+            student_logits=None,
+            teacher_hidden_states=None,
+            teacher_key_ids=None,
+            teacher_unembeds=None,
+            config=None,
+            data_format=None,
+            local_cp_size=None,
+        ):
+            called.update(
+                student_logits=student_logits,
+                teacher_key_ids=teacher_key_ids,
+                local_cp_size=local_cp_size,
+                unembed_keys=set(teacher_unembeds.keys()),
+            )
+            return {"distillation_losses": torch.zeros(1, 4)}
+
+        monkeypatch.setattr(
+            "verl_omni.trainer.distillation.megatron_nitrobrew_loss.compute_nitrobrew_multi_kl_megatron",
+            fake_megatron_kl,
+        )
+        student_logits = torch.randn(1, 4, 16)  # [bsz, seqlen/cp, vocab/tp] shard
+        cfg = type("C", (), {"strategy": "megatron"})()
+        out = omni_distillation_ppo_loss(
+            config=cfg,
+            distillation_config=_DistillConfig("nitrobrew"),
+            data=self._data(with_key_ids=True),
+            student_logits=student_logits,
+            data_format="thd",
+        )
+        assert "distillation_losses" in out
+        assert called["student_logits"] is student_logits
+        assert called["teacher_key_ids"].tolist() == [0]
+        assert called["local_cp_size"] == 2  # unwrapped from NonTensorData
+        assert called["unembed_keys"] == {0}
+
+    def test_megatron_reverse_mode_uses_reverse_kernel(self, monkeypatch):
+        called = {}
+
+        def fake_reverse(**kwargs):
+            called["reverse"] = True
+            return {"distillation_losses": torch.zeros(1, 4)}
+
+        def fake_forward(**kwargs):
+            raise AssertionError("forward kernel must not be called in reverse mode")
+
+        monkeypatch.setattr(
+            "verl_omni.trainer.distillation.megatron_nitrobrew_loss.compute_nitrobrew_multi_reverse_kl_megatron",
+            fake_reverse,
+        )
+        monkeypatch.setattr(
+            "verl_omni.trainer.distillation.megatron_nitrobrew_loss.compute_nitrobrew_multi_kl_megatron",
+            fake_forward,
+        )
+        cfg = type("C", (), {"strategy": "megatron"})()
+        out = omni_distillation_ppo_loss(
+            config=cfg,
+            distillation_config=_DistillConfig("nitrobrew_reverse_kl"),
+            data=self._data(),
+            student_logits=torch.randn(1, 4, 16),
+            data_format="thd",
+        )
+        assert called["reverse"]
+        assert "distillation_losses" in out
+
+
 class TestSingleTeacherRouting:
     def test_zero_key_ids_with_single_teacher(self):
         from verl_omni.trainer.distillation.losses import _per_token_teacher_key_ids

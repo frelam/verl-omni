@@ -777,6 +777,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             elif self.distillation_enabled:
                 loss_mode = distillation_config.distillation_loss.loss_mode
                 if loss_mode in HIDDEN_STATE_LOSS_MODES:
+                    if actor_config.strategy == "megatron":
+                        # The fused mcore forward has no logits-processor hook, so the
+                        # nitrobrew KL would never be computed; fail loudly instead of
+                        # silently dropping the distillation signal.
+                        if actor_config.model_config.get("use_fused_kernels", False):
+                            raise NotImplementedError(
+                                "hidden-state (nitrobrew) OPD with the megatron backend requires "
+                                "actor_rollout_ref.model.use_fused_kernels=False: the fused mcore "
+                                "forward does not invoke the logits processor that computes the KL."
+                            )
                     from verl_omni.trainer.distillation.losses import omni_distillation_ppo_loss
 
                     self.loss_fn = partial(

@@ -101,12 +101,18 @@ def _distillation_loss_settings_use_hidden(distillation_config) -> bool:
 
 
 def _compute_nitrobrew_in_logits_processor(
+    config,
     distillation_config,
     data,
     student_logits: torch.Tensor,
     data_format: str,
 ) -> dict[str, torch.Tensor]:
-    """Run the chunked nitrobrew KL on the full student_logits tensor."""
+    """Run the chunked nitrobrew KL on the student_logits tensor.
+
+    Under FSDP the logits are the full ``[N, V]`` tensor; under Megatron they
+    are the local ``[N, V/tp]`` vocab shard (sequence already CP-sharded), so a
+    vocab-parallel kernel runs instead.
+    """
 
     loss_mode = distillation_config.distillation_loss.loss_mode
     reverse = loss_mode == "nitrobrew_reverse_kl"
@@ -118,6 +124,29 @@ def _compute_nitrobrew_in_logits_processor(
 
     # key_to_id maps teacher key -> int id (MOPD-aware). Rearrange unembeds by id.
     unembeds = {int(key_to_id[k]): W for k, W in unembeds_map.items()}
+
+    if getattr(config, "strategy", "fsdp") == "megatron":
+        from verl.utils import tensordict_utils as tu
+
+        from verl_omni.trainer.distillation.megatron_nitrobrew_loss import (
+            compute_nitrobrew_multi_kl_megatron,
+            compute_nitrobrew_multi_reverse_kl_megatron,
+        )
+
+        # Multi-teacher routing rides the per-sequence ids; the megatron entry
+        # expands them over tokens and CP-splits alongside the hidden states.
+        per_seq_key_ids = data.get("teacher_key_ids", None)
+        local_cp_size = tu.get_non_tensor_data(data=data, key="local_cp_size", default=None)
+        fn = compute_nitrobrew_multi_reverse_kl_megatron if reverse else compute_nitrobrew_multi_kl_megatron
+        return fn(
+            student_logits=student_logits,
+            teacher_hidden_states=teacher_hidden_states,
+            teacher_key_ids=per_seq_key_ids,
+            teacher_unembeds=unembeds,
+            config=distillation_config,
+            data_format=data_format,
+            local_cp_size=local_cp_size,
+        )
 
     # Per-token route: single-teacher degenerate to all-zero id; multi-teacher
     # expands per-sequence ids over the jagged token offsets (see note below).
@@ -183,7 +212,7 @@ def omni_distillation_ppo_loss(
     use_hidden = loss_mode in HIDDEN_STATE_LOSS_MODES
 
     if student_logits is not None and use_hidden:
-        return _compute_nitrobrew_in_logits_processor(distillation_config, data, student_logits, data_format)
+        return _compute_nitrobrew_in_logits_processor(config, distillation_config, data, student_logits, data_format)
 
     return distillation_ppo_loss(
         config,
