@@ -165,10 +165,13 @@ class RayTrainerTaskRunner:
     def _load_tokenizer_and_processor(config, local_path: str):
         """Load tokenizer and processor for dataset construction."""
         model_cfg = config.actor_rollout_ref.model
-        model_type = model_cfg.get("model_type", "language_model")
         trust_remote_code = model_cfg.get("trust_remote_code", False) or config.data.get("trust_remote_code", False)
+        # ``model_type`` selects the training engine, not the config class:
+        # ``language_model`` (verl's native Megatron engine) is valid with
+        # OmniModelConfig, which still needs the adapter's tokenizer/processor.
+        target = str(model_cfg.get("_target_", ""))
 
-        if model_type == "omni_model":
+        if model_cfg.get("model_type", "language_model") == "omni_model" or target.endswith("OmniModelConfig"):
             from verl.utils.config import omega_conf_to_dataclass
 
             from verl_omni.workers.config import OmniModelConfig

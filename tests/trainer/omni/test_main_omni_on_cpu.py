@@ -184,6 +184,36 @@ class TestLoadTokenizerAndProcessor:
         assert tokenizer == "tokenizer"
         assert processor == "processor"
 
+    def test_language_model_dispatch_still_uses_omni_model_config(self, monkeypatch, tmp_path):
+        """``model_type=language_model`` selects verl's engine, not a plain HF model config."""
+        config = OmegaConf.create(
+            {
+                "data": {"trust_remote_code": False},
+                "actor_rollout_ref": {
+                    "model": {
+                        "_target_": "verl_omni.workers.config.omni.OmniModelConfig",
+                        "model_type": "language_model",
+                        "architecture": "Qwen3_5ForConditionalGeneration",
+                        "model_stage": "thinker",
+                        "tokenizer_path": str(tmp_path),
+                    }
+                },
+            }
+        )
+
+        mock_model_config = MagicMock()
+        mock_model_config.tokenizer = "tokenizer"
+        mock_model_config.get_processor.return_value = "processor"
+        monkeypatch.setattr(
+            "verl.utils.config.omega_conf_to_dataclass",
+            lambda _cfg: mock_model_config,
+        )
+
+        tokenizer, processor = RayTrainerTaskRunner._load_tokenizer_and_processor(config, str(tmp_path))
+
+        assert tokenizer == "tokenizer"
+        assert processor == "processor"
+
 
 class TestRayMasterPortRangeSchema:
     """The gpu-smoke runner overrides trainer.ray_master_port_range without the append prefix."""
