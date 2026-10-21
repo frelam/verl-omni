@@ -7,17 +7,21 @@
 #
 # Full-parameter language-model RL; the vision tower stays frozen.
 # Colocated (hybrid) recipe: the Megatron actor and the vLLM-Omni servers share
-# the same four 8-GPU nodes (32 GPUs) and take turns. Actor grid is
-# TP4 x CP2 x PP2 x DP2 with EP8/ETP1; rollout uses TP4, i.e. eight replicas.
+# the same single 16-NPU node and take turns. Actor grid is
+# TP4 x CP2 x PP2 x DP1 with EP8/ETP1; rollout uses TP4, i.e. four replicas.
 # The point of this recipe is to exercise Megatron hybrid TP+CP+PP+EP parallelism
 # while the actor and rollout are time-multiplexed on the same devices.
 # Prepare TRAIN_FILE/VAL_FILE with examples/gspo_trainer/data_process/geo3k.py.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
-: "${MODEL_PATH:?Set MODEL_PATH to a Qwen3.5 or Qwen3.6 checkpoint}"
-: "${TRAIN_FILE:?Set TRAIN_FILE to prepared Geo3K train.parquet}"
-: "${VAL_FILE:?Set VAL_FILE to prepared Geo3K validation.parquet}"
+# 路径直接在这里改；外面若已设置同名环境变量，则以环境变量为准。
+MODEL_PATH=${MODEL_PATH:-/path/to/Qwen3.5-or-Qwen3.6-checkpoint}
+TRAIN_FILE=${TRAIN_FILE:-$HOME/data/geo3k/train.parquet}
+VAL_FILE=${VAL_FILE:-$HOME/data/geo3k/test.parquet}
+[[ -d "${MODEL_PATH}" ]] || { echo "MODEL_PATH 不存在: ${MODEL_PATH}" >&2; exit 1; }
+[[ -f "${TRAIN_FILE}" ]] || { echo "TRAIN_FILE 不存在: ${TRAIN_FILE}" >&2; exit 1; }
+[[ -f "${VAL_FILE}" ]] || { echo "VAL_FILE 不存在: ${VAL_FILE}" >&2; exit 1; }
 OUTPUT_DIR=${OUTPUT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/qwen35-run.XXXXXX")}
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR=$(cd "${OUTPUT_DIR}" && pwd)
@@ -26,9 +30,10 @@ RUN_DIR=$(mktemp -d "${OUTPUT_DIR}/run.XXXXXX")
 echo "Qwen3.5/Qwen3.6 artifacts: ${RUN_DIR}"
 # qwen3_5_moe for MoE checkpoints, qwen3_5 for dense ones.
 PIPELINE_NAME=${PIPELINE_NAME:-qwen3_5_moe}
-# EP lives on its own axis (expert list), not on the dense TP/CP/PP/DP grid:
-# with expert_tensor_parallel_size=1 the only requirement is that
-# world_size % (EP * PP) == 0 and 32 / (EP * PP) == DP. Dense checkpoints
+# EP is not an extra orthogonal axis: the expert grid re-cuts the dense
+# TP/CP plane (its cp is forced to 1 and folded into expert_dp). With
+# expert_tensor_parallel_size=1 this means EP == TP * CP, so that
+# expert_dp = world_size / (EP * PP) equals DP. Dense checkpoints
 # have no experts -> EP=1.
 TP=${TP:-4}
 CP=${CP:-2}
@@ -55,18 +60,16 @@ args=(
   actor_rollout_ref.model.model_type=language_model
   # THD packing is on by default through OmniModelConfig.use_remove_padding.
   actor_rollout_ref.actor.ppo_mini_batch_size=64
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
-  actor_rollout_ref.actor.use_dynamic_bsz=false
+  # Dynamic micro-batching: the engine packs sequences up to this per-GPU token
+  # budget instead of a fixed micro-batch size. CP multiplies the budget, so
+  # 4096 here packs two full 4096-token sequences per micro-batch.
+  actor_rollout_ref.actor.use_dynamic_bsz=true
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096
   # CP>1 enables Megatron's per-token loss; only globally composable aggregations
   # are allowed. token-mean divides the summed token losses by the global token
   # count, which is exact after the CP reduction.
   actor_rollout_ref.actor.loss_agg_mode=token-mean
   actor_rollout_ref.actor.optim.lr=1e-6
-  actor_rollout_ref.actor.optim.lr_warmup_steps=-1
-  actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0
-  actor_rollout_ref.actor.use_kl_loss=false
-  actor_rollout_ref.actor.kl_loss_coef=0.001
-  actor_rollout_ref.actor.kl_loss_type=low_var_kl
   actor_rollout_ref.actor.optim.weight_decay=0.1
   actor_rollout_ref.actor.optim.use_precision_aware_optimizer=true
   # Offload FP32 Adam states and use precision-aware updates for the actor.
@@ -80,7 +83,6 @@ args=(
   # while the vLLM-Omni servers own the devices.
   actor_rollout_ref.actor.megatron.param_offload=true
   actor_rollout_ref.actor.megatron.optimizer_offload=true
-  actor_rollout_ref.actor.megatron.grad_offload=true
   # Match the checkpoint: train/eval log-probs must not differ due to dropout.
   +actor_rollout_ref.actor.megatron.override_transformer_config.attention_dropout=0.0
   +actor_rollout_ref.actor.megatron.override_transformer_config.hidden_dropout=0.0
@@ -92,8 +94,8 @@ args=(
   actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
   actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
   actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
-  actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false
-  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
+  actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192
   'actor_rollout_ref.ref.megatron.override_transformer_config={gradient_accumulation_fusion:false,attention_dropout:0.0,hidden_dropout:0.0}'
   # Colocated actor + rollout: one worker group, vLLM-Omni servers sleep while
   # the actor trains and wake for generation.
@@ -104,9 +106,9 @@ args=(
   actor_rollout_ref.rollout.val_kwargs.temperature=0
   actor_rollout_ref.rollout.val_kwargs.n=1
   # Colocated: the rollout replicas are built from the actor worker group, so
-  # there is no separate node budget; 32 GPUs / TP4 = 8 replicas.
+  # there is no separate node budget; 16 NPUs / TP4 = 4 replicas.
   actor_rollout_ref.rollout.nnodes=0
-  actor_rollout_ref.rollout.n_gpus_per_node=8
+  actor_rollout_ref.rollout.n_gpus_per_node=16
   actor_rollout_ref.rollout.tensor_model_parallel_size=${TP}
   actor_rollout_ref.rollout.load_format=safetensors
   actor_rollout_ref.rollout.max_model_len=4096
@@ -115,23 +117,19 @@ args=(
   actor_rollout_ref.rollout.gpu_memory_utilization=0.6
   actor_rollout_ref.rollout.enable_prefix_caching=false
   actor_rollout_ref.rollout.logprobs_mode=raw_logprobs
-  actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=false
-  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
+  actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192
   +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=${PIPELINE_NAME}
   +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.limit_mm_per_prompt.image=1
   +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.limit_mm_per_prompt.video=0
   algorithm.adv_estimator=grpo
-  algorithm.use_kl_in_reward=false
+  # omni_megatron_trainer defaults bypass_mode to true for the async path; the
+  # sync recipe keeps the actor's recomputed log-probs as the PPO anchor.
   algorithm.rollout_correction.bypass_mode=false
-  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES=verl_omni
-  '+ray_kwargs.ray_init.runtime_env.env_vars.TENSORBOARD_DIR=${oc.env:TENSORBOARD_DIR}'
-  '+ray_kwargs.ray_init.runtime_env.env_vars.CUDA_DEVICE_MAX_CONNECTIONS=${oc.env:CUDA_DEVICE_MAX_CONNECTIONS,1}'
-  '+ray_kwargs.ray_init.runtime_env.env_vars.RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO="0"'
-  '+ray_kwargs.ray_init.runtime_env.env_vars.PYTHONUNBUFFERED="1"'
   # omni_sync == synchronous colocated trainer: actor and rollout share devices.
   trainer.v1.trainer_mode=omni_sync
-  trainer.nnodes=4
-  trainer.n_gpus_per_node=8
+  trainer.nnodes=1
+  trainer.n_gpus_per_node=16
   trainer.total_training_steps=150
   trainer.val_before_train=true
   trainer.save_freq=-1
