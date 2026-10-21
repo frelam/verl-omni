@@ -52,8 +52,8 @@ args=(
   "data.train_files=${TRAIN_FILE}"
   "data.val_files=${VAL_FILE}"
   data.train_batch_size=64
-  data.max_prompt_length=1024
-  data.max_response_length=3072
+  data.max_prompt_length=3072
+  data.max_response_length=16384
   data.filter_overlong_prompts=true
   # `language_model` dispatches to verl's MegatronEngineWithLMHead while the
   # `_target_` still loads OmniModelConfig and the Qwen3.5 adapter.
@@ -61,10 +61,11 @@ args=(
   # THD packing is on by default through OmniModelConfig.use_remove_padding.
   actor_rollout_ref.actor.ppo_mini_batch_size=64
   # Dynamic micro-batching: the engine packs sequences up to this per-GPU token
-  # budget instead of a fixed micro-batch size. CP multiplies the budget, so
-  # 4096 here packs two full 4096-token sequences per micro-batch.
+  # budget instead of a fixed micro-batch size. It is a packing budget, not a
+  # truncation limit, but verl asserts budget * CP >= longest sequence, so with
+  # 3072 + 16384 tokens and CP2 the minimum is 9728.
   actor_rollout_ref.actor.use_dynamic_bsz=true
-  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9728
   # CP>1 enables Megatron's per-token loss; only globally composable aggregations
   # are allowed. token-mean divides the summed token losses by the global token
   # count, which is exact after the CP reduction.
@@ -95,7 +96,8 @@ args=(
   actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
   actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true
-  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192
+  # Same CP-aware floor as the actor: budget * CP2 must cover prompt+response.
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=9728
   'actor_rollout_ref.ref.megatron.override_transformer_config={gradient_accumulation_fusion:false,attention_dropout:0.0,hidden_dropout:0.0}'
   # Colocated actor + rollout: one worker group, vLLM-Omni servers sleep while
   # the actor trains and wake for generation.
@@ -111,17 +113,25 @@ args=(
   actor_rollout_ref.rollout.n_gpus_per_node=16
   actor_rollout_ref.rollout.tensor_model_parallel_size=${TP}
   actor_rollout_ref.rollout.load_format=safetensors
-  actor_rollout_ref.rollout.max_model_len=4096
+  # Must cover max_prompt_length + max_response_length (3072 + 16384),
+  # otherwise vLLM caps generation below the requested response length.
+  actor_rollout_ref.rollout.max_model_len=19456
   actor_rollout_ref.rollout.max_num_seqs=32
-  actor_rollout_ref.rollout.max_num_batched_tokens=4096
+  # Prefill budget only; prompts are capped at 3072 tokens, so this stays far
+  # below max_model_len (chunked prefill is on by default).
+  actor_rollout_ref.rollout.max_num_batched_tokens=6144
   actor_rollout_ref.rollout.gpu_memory_utilization=0.6
   actor_rollout_ref.rollout.enable_prefix_caching=false
   actor_rollout_ref.rollout.logprobs_mode=raw_logprobs
   actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true
-  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192
+  # Actor-side log-prob inference shares the same CP-aware floor.
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=9728
   +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name=${PIPELINE_NAME}
   +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.limit_mm_per_prompt.image=1
   +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.limit_mm_per_prompt.video=0
+  # NPU: FRACTAL_NZ weights break the RL weight update (wake_up refuses to run).
+  # Disable NZ so the actor -> rollout weight sync stays numerically exact.
+  +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.additional_config.weight_nz_mode=0
   algorithm.adv_estimator=grpo
   # omni_megatron_trainer defaults bypass_mode to true for the async path; the
   # sync recipe keeps the actor's recomputed log-probs as the PPO anchor.
