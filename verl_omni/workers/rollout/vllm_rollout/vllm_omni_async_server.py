@@ -274,6 +274,12 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             )
 
         engine_client = AsyncOmni(**engine_args)
+        if getattr(self.config, "enable_rollout_routing_replay", False):
+            from verl_omni.workers.rollout.vllm_rollout.routed_experts_scheduler import (
+                verify_routed_experts_engine,
+            )
+
+            verify_routed_experts_engine(engine_client)
         app = build_app(args)
         await omni_init_app_state(engine_client, app.state, args)
 

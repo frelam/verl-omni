@@ -45,10 +45,28 @@ def test_preprocess_engine_kwargs_requests_routed_experts():
     assert engine_kwargs["enable_return_routed_experts"] is True
 
 
+def test_preprocess_engine_kwargs_installs_the_r3_async_scheduler():
+    engine_kwargs: dict = {}
+    _strategy(capture=True).preprocess_engine_kwargs(engine_kwargs)
+    assert engine_kwargs["scheduler_cls"].endswith(".R3ARAsyncScheduler")
+
+
+def test_preprocess_engine_kwargs_installs_the_r3_sync_scheduler_when_async_is_off():
+    engine_kwargs: dict = {"async_scheduling": False}
+    _strategy(capture=True).preprocess_engine_kwargs(engine_kwargs)
+    assert engine_kwargs["scheduler_cls"].endswith(".R3ARScheduler")
+
+
+def test_preprocess_engine_kwargs_rejects_a_user_scheduler():
+    with pytest.raises(ValueError, match="scheduler_cls"):
+        _strategy(capture=True).preprocess_engine_kwargs({"scheduler_cls": "custom.Scheduler"})
+
+
 def test_preprocess_engine_kwargs_untouched_when_disabled():
     engine_kwargs: dict = {}
     _strategy(capture=False).preprocess_engine_kwargs(engine_kwargs)
     assert "enable_return_routed_experts" not in engine_kwargs
+    assert "scheduler_cls" not in engine_kwargs
 
 
 def test_preprocess_engine_kwargs_requires_supported_vllm(monkeypatch):

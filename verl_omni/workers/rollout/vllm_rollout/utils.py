@@ -146,6 +146,19 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         standard = self._get_standard_weight_model_and_config()
         if standard is not None and _is_moe_engine(standard[0]):
             patch_vllm_moe_model_weight_loader(standard[0])
+        self._assert_routed_experts_capturer_ready()
+
+    def _assert_routed_experts_capturer_ready(self) -> None:
+        """Fail fast when the platform cannot capture MoE routes for R3."""
+        model_runner = getattr(self, "model_runner", None)
+        model_config = getattr(model_runner, "model_config", None)
+        if model_config is None or not getattr(model_config, "enable_return_routed_experts", False):
+            return
+        if not getattr(model_runner, "routed_experts_initialized", False):
+            raise RuntimeError(
+                "enable_return_routed_experts is set, but this worker's model runner never initialized the "
+                "routed-experts capturer; the current platform/model MoE path cannot capture routes for R3."
+            )
 
     def update_weights_from_ipc(
         self,

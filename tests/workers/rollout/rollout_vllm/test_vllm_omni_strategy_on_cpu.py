@@ -192,7 +192,10 @@ def test_ar_strategy_rejects_unsupported_prompt_fields(output_modalities):
 
 
 def test_ar_strategy_preserves_output_conversion():
-    server = SimpleNamespace(global_steps=12)
+    server = SimpleNamespace(
+        global_steps=12,
+        config=SimpleNamespace(enable_rollout_routing_replay=False),
+    )
     strategy = ARStrategy(server)
     completion = SimpleNamespace(
         token_ids=[7, 8],
@@ -220,7 +223,7 @@ def test_ar_strategy_preserves_output_conversion():
 
 def test_ar_strategy_preserves_engine_kwarg_normalization(monkeypatch):
     monkeypatch.setattr(ar_strategy_module.OmniRolloutPipelineBase, "get_class", lambda pipeline_name: None)
-    strategy = ARStrategy(SimpleNamespace())
+    strategy = ARStrategy(SimpleNamespace(config=SimpleNamespace(enable_rollout_routing_replay=False)))
     engine_kwargs = {
         "output_mode": "ar",
         "custom_pipeline": "unused",
@@ -250,7 +253,7 @@ def test_ar_strategy_preserves_engine_kwarg_normalization(monkeypatch):
 )
 def test_ar_strategy_preserves_hyphenated_timeout_kwargs(monkeypatch, timeout_kwargs, expected):
     monkeypatch.setattr(ar_strategy_module.OmniRolloutPipelineBase, "get_class", lambda pipeline_name: None)
-    strategy = ARStrategy(SimpleNamespace())
+    strategy = ARStrategy(SimpleNamespace(config=SimpleNamespace(enable_rollout_routing_replay=False)))
     engine_kwargs = {"pipeline_name": "missing", **timeout_kwargs}
 
     strategy.preprocess_engine_kwargs(engine_kwargs)
@@ -277,7 +280,12 @@ def test_ar_strategy_honors_adapter_chunking_and_weight_sync_contracts(monkeypat
             return {}
 
     monkeypatch.setattr(ar_strategy_module.OmniRolloutPipelineBase, "get_class", lambda pipeline_name: Adapter)
-    strategy = ARStrategy(SimpleNamespace(_rollout_flags={}))
+    strategy = ARStrategy(
+        SimpleNamespace(
+            _rollout_flags={},
+            config=SimpleNamespace(enable_rollout_routing_replay=False),
+        )
+    )
 
     def write_deploy_config(*args):
         strategy._weight_sync_stage_ids = Adapter.weight_sync_stage_ids("full")
@@ -328,6 +336,7 @@ def test_ar_strategy_resolves_nonzero_policy_and_weight_sync_stages(monkeypatch)
             text_encoder_tp_size=1,
             max_model_len=64,
             max_num_batched_tokens=64,
+            enable_rollout_routing_replay=False,
         ),
         _rollout_flags={},
     )
@@ -370,6 +379,7 @@ def test_ar_strategy_moves_capacity_overrides_to_each_stage(monkeypatch):
             text_encoder_tp_size=1,
             max_model_len=4096,
             max_num_batched_tokens=8192,
+            enable_rollout_routing_replay=False,
         ),
         _rollout_flags={},
     )
@@ -417,7 +427,12 @@ def test_ar_strategy_rejects_unknown_adapter_stages(monkeypatch, policy_stage_id
             return weight_sync_stage_ids
 
     monkeypatch.setattr(ar_strategy_module.OmniRolloutPipelineBase, "get_class", lambda pipeline_name: Adapter)
-    strategy = ARStrategy(SimpleNamespace(_rollout_flags={}))
+    strategy = ARStrategy(
+        SimpleNamespace(
+            _rollout_flags={},
+            config=SimpleNamespace(enable_rollout_routing_replay=False),
+        )
+    )
 
     with pytest.raises(ValueError, match=message):
         strategy.preprocess_engine_kwargs({"pipeline_name": "adapter"})

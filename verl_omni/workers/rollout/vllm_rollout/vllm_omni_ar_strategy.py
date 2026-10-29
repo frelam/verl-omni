@@ -41,6 +41,11 @@ logger.setLevel(logging.INFO)
 
 _WORKER_EXTENSION = "verl_omni.workers.rollout.vllm_rollout.utils.vLLMOmniColocateWorkerExtension"
 
+# vLLM-Omni's AR schedulers drop MoE routes; R3 swaps in verl-omni's subclasses.
+_R3_SCHEDULER_MODULE = "verl_omni.workers.rollout.vllm_rollout.routed_experts_scheduler"
+_R3_SYNC_SCHEDULER = f"{_R3_SCHEDULER_MODULE}.R3ARScheduler"
+_R3_ASYNC_SCHEDULER = f"{_R3_SCHEDULER_MODULE}.R3ARAsyncScheduler"
+
 
 def _drop_none_mapping_values(value: Any) -> Any:
     if isinstance(value, dict):
@@ -123,6 +128,13 @@ class ARStrategy(OmniStrategyBase):
                     "enable_rollout_routing_replay requires a single-output AR pipeline, got final output "
                     f"modalities {self._rollout_output_modalities}."
                 )
+            if engine_kwargs.get("scheduler_cls") is not None or engine_kwargs.get("scheduler-cls") is not None:
+                raise ValueError(
+                    "enable_rollout_routing_replay owns the vLLM-Omni scheduler because the built-in AR "
+                    "scheduler never returns routed experts; remove engine_kwargs.vllm_omni.scheduler_cls."
+                )
+            async_scheduling = engine_kwargs.get("async_scheduling", engine_kwargs.get("async-scheduling", True))
+            engine_kwargs["scheduler_cls"] = _R3_ASYNC_SCHEDULER if async_scheduling else _R3_SYNC_SCHEDULER
             engine_kwargs["enable_return_routed_experts"] = True
 
         stage_init_timeout = engine_kwargs.get("stage_init_timeout") or engine_kwargs.get("stage-init-timeout")
