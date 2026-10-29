@@ -73,6 +73,43 @@ def _validate_delta_sharded(config: Any) -> None:
             )
 
 
+def _validate_router_replay(config: Any) -> None:
+    """Fail-fast gates for the R2/R3 router-replay pairing.
+
+    R3 replays the routes the rollout actually used, so the rollout capture switch
+    and the actor's engine mode must agree; either side alone produces no replay.
+    R3 targets are jagged sequences, so padded (BSHD) batches cannot be aligned.
+    """
+    mode = _select(config, "actor_rollout_ref.actor.megatron.router_replay.mode", "disabled")
+    capture = bool(_select(config, "actor_rollout_ref.rollout.enable_rollout_routing_replay", False))
+    if mode == "disabled" and not capture:
+        return
+
+    strategy = _select(config, "actor_rollout_ref.actor.strategy")
+    if mode != "disabled" and strategy != "megatron":
+        raise ValueError(
+            f"actor.megatron.router_replay.mode={mode!r} requires actor.strategy='megatron', got {strategy!r}."
+        )
+    if mode == "R3" and not capture:
+        raise ValueError(
+            "actor.megatron.router_replay.mode='R3' requires "
+            "actor_rollout_ref.rollout.enable_rollout_routing_replay=true so the rollout records its routes."
+        )
+    if mode != "R3" and capture:
+        raise ValueError(
+            "actor_rollout_ref.rollout.enable_rollout_routing_replay=true is only consumed by "
+            f"actor.megatron.router_replay.mode='R3', got mode={mode!r}."
+        )
+    if mode == "R3":
+        if not _select(config, "actor_rollout_ref.actor.megatron.use_remove_padding", True):
+            raise ValueError(
+                "R3 router replay requires THD packing (actor.megatron.use_remove_padding=true); "
+                "rollout routes are jagged sequences and cannot be aligned to padded BSHD batches."
+            )
+        if _select(config, "actor_rollout_ref.actor.megatron.pad_to_length", False):
+            raise ValueError("R3 router replay does not support actor.megatron.pad_to_length=true.")
+
+
 def validate_config(config: Any) -> None:
     """Validate configuration values that otherwise trigger silent fallbacks."""
     if _select(config, "actor_rollout_ref.actor.enable_timestep_staging", False):
@@ -81,6 +118,7 @@ def validate_config(config: Any) -> None:
             raise ValueError("Timestep staging requires ulysses_sequence_parallel_size=1.")
 
     _validate_delta_sharded(config)
+    _validate_router_replay(config)
 
     if _select(config, "actor_rollout_ref.actor.use_no_sync_for_gradient_accumulation", False):
         strategy = _select(config, "actor_rollout_ref.actor.strategy")
