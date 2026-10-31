@@ -194,9 +194,8 @@ def test_validate_config_router_replay_requires_megatron():
         validate_config(_router_replay_config(mode="R2", strategy="fsdp"))
 
 
-def test_validate_config_r3_requires_thd_packing():
-    with pytest.raises(ValueError, match="THD packing"):
-        validate_config(_router_replay_config(mode="R3", capture=True, use_remove_padding=False))
+def test_validate_config_r3_admits_bshd_packing():
+    validate_config(_router_replay_config(mode="R3", capture=True, use_remove_padding=False))
 
 
 def test_validate_config_r3_rejects_pad_to_length():

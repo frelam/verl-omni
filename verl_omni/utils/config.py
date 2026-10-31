@@ -78,7 +78,6 @@ def _validate_router_replay(config: Any) -> None:
 
     R3 replays the routes the rollout actually used, so the rollout capture switch
     and the actor's engine mode must agree; either side alone produces no replay.
-    R3 targets are jagged sequences, so padded (BSHD) batches cannot be aligned.
     """
     mode = _select(config, "actor_rollout_ref.actor.megatron.router_replay.mode", "disabled")
     capture = bool(_select(config, "actor_rollout_ref.rollout.enable_rollout_routing_replay", False))
@@ -100,14 +99,8 @@ def _validate_router_replay(config: Any) -> None:
             "actor_rollout_ref.rollout.enable_rollout_routing_replay=true is only consumed by "
             f"actor.megatron.router_replay.mode='R3', got mode={mode!r}."
         )
-    if mode == "R3":
-        if not _select(config, "actor_rollout_ref.actor.megatron.use_remove_padding", True):
-            raise ValueError(
-                "R3 router replay requires THD packing (actor.megatron.use_remove_padding=true); "
-                "rollout routes are jagged sequences and cannot be aligned to padded BSHD batches."
-            )
-        if _select(config, "actor_rollout_ref.actor.megatron.pad_to_length", False):
-            raise ValueError("R3 router replay does not support actor.megatron.pad_to_length=true.")
+    if mode == "R3" and _select(config, "actor_rollout_ref.actor.megatron.pad_to_length", False):
+        raise ValueError("R3 router replay does not support actor.megatron.pad_to_length=true.")
 
 
 def validate_config(config: Any) -> None:
