@@ -36,10 +36,10 @@ index 19bf2a8c..59ed6dc7 100644
      """A minimal tokenizer with a non-zero pad_token_id for testing."""
  
 diff --git a/tests/utils/megatron/test_router_replay_model_walk_on_cpu.py b/tests/utils/megatron/test_router_replay_model_walk_on_cpu.py
-index aa89aa9f..347a12f6 100644
+index aa89aa9f..0ef42f90 100644
 --- a/tests/utils/megatron/test_router_replay_model_walk_on_cpu.py
 +++ b/tests/utils/megatron/test_router_replay_model_walk_on_cpu.py
-@@ -135,3 +135,96 @@ def test_mtp_routers_are_not_addressed(orphans_then_model):
+@@ -135,3 +135,132 @@ def test_mtp_routers_are_not_addressed(orphans_then_model):
  
      assert [ln for ln, _ in router_replay_utils.iter_model_routers(model)] == list(range(1, NUM_LAYERS + 1))
      assert model.mtp[0].router_replay.router_replay_action is None
@@ -136,6 +136,42 @@ index aa89aa9f..347a12f6 100644
 +    router = RouterReplay(is_mtp_layer=True)
 +
 +    assert router.is_mtp_layer is True
++
++
++def test_backward_replay_matches_the_recompute_row_count(monkeypatch):
++    """Recompute must not replay a queued micro-batch with a different row count."""
++    monkeypatch.setattr(RouterReplay, "router_instances", [])
++    router = RouterReplay()
++    router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
++    stale = torch.full((200, 2), 7, dtype=torch.int64)
++    fresh = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0], [0, 2], [1, 3]], dtype=torch.int64)
++    router.replay_backward_list = [stale, fresh]
++    router.replay_backward_mask_list = [torch.ones(200, dtype=torch.bool), torch.ones(6, dtype=torch.bool)]
++    scores = torch.arange(24, dtype=torch.float32).reshape(6, 4)
++
++    def native_topk(scores, topk, **_kwargs):
++        return torch.topk(scores, k=topk, dim=1)
++
++    _, indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
++
++    torch.testing.assert_close(indices, fresh)
++    assert router.replay_backward_list == []
++    assert router.replay_backward_mask_list == []
++
++
++def test_backward_replay_reports_unmatched_recompute(monkeypatch):
++    monkeypatch.setattr(RouterReplay, "router_instances", [])
++    router = RouterReplay()
++    router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
++    router.replay_backward_list = [torch.zeros((200, 2), dtype=torch.int64)]
++    router.replay_backward_mask_list = [None]
++    scores = torch.zeros((6, 4))
++
++    def native_topk(scores, topk, **_kwargs):
++        return torch.topk(scores, k=topk, dim=1)
++
++    with pytest.raises(RuntimeError, match=r"no queued route tensor matches; queued=\[\(200, 2\)\]"):
++        router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
 diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
 index d0e3038e..115826f8 100644
 --- a/verl/experimental/agent_loop/agent_loop.py
@@ -157,10 +193,19 @@ index d0e3038e..115826f8 100644
          if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
              optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
 diff --git a/verl/utils/megatron/router_replay_patch.py b/verl/utils/megatron/router_replay_patch.py
-index a6940f9c..ec00c492 100644
+index a6940f9c..68ba8c16 100644
 --- a/verl/utils/megatron/router_replay_patch.py
 +++ b/verl/utils/megatron/router_replay_patch.py
-@@ -81,8 +81,11 @@ class RouterReplay:
+@@ -34,6 +34,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
+ 
+ # https://github.com/THUDM/slime/blob/main/slime/utils/routing_replay.py
+ 
++_stale_replay_warned = False
++
+ 
+ class RouterReplayAction(Enum):
+     RECORD = "record"
+@@ -81,8 +83,11 @@ class RouterReplay:
          for router in RouterReplay.router_instances:
              router.clear_indices()
  
@@ -173,7 +218,57 @@ index a6940f9c..ec00c492 100644
          self.target_topk_idx = None  # For replay
          self.target_replay_mask = None
          self.recorded_topk_idx = None  # For recording
-@@ -124,15 +127,26 @@ class RouterReplay:
+@@ -106,6 +111,34 @@ class RouterReplay:
+         """Records the topk indices."""
+         self.recorded_topk_idx = topk_indices
+ 
++    def _take_backward_entry(self, num_rows: int):
++        """Take the queued routes belonging to a recompute of ``num_rows`` tokens.
++
++        Recompute does not enter a router exactly once per forward: pipeline
++        interleaving and chunked recompute can reorder it, and a skipped segment
++        leaves its entry behind. Consuming the queue head positionally then
++        replays another micro-batch's routes, which surfaces as a row-count
++        mismatch. Match on the row count instead and drop the older leftovers.
++        """
++        for position, candidate in enumerate(self.replay_backward_list):
++            if candidate.shape[0] != num_rows:
++                continue
++            if position:
++                global _stale_replay_warned
++                if not _stale_replay_warned:
++                    _stale_replay_warned = True
++                    warnings.warn(
++                        "Router replay dropped unconsumed route entries "
++                        f"{[tuple(routes.shape) for routes in self.replay_backward_list[:position]]}: "
++                        "those layers were never re-entered during activation recompute.",
++                        stacklevel=2,
++                    )
++                del self.replay_backward_list[:position]
++                del self.replay_backward_mask_list[:position]
++            mask = self.replay_backward_mask_list.pop(0)
++            return self.replay_backward_list.pop(0), mask
++        return None, None
++
+     def get_replay_topk(self, scores, topk, num_groups=None, group_topk=None, default_compute_topk=None):
+         """Select native or replayed experts using the current replay action."""
+         action = self.router_replay_action
+@@ -118,21 +151,39 @@ class RouterReplay:
+             indices = self.target_topk_idx
+             replay_mask = self.target_replay_mask
+         elif action == RouterReplayAction.REPLAY_BACKWARD and self.replay_backward_list:
+-            indices = self.replay_backward_list.pop(0)
+-            replay_mask = self.replay_backward_mask_list.pop(0)
++            indices, replay_mask = self._take_backward_entry(scores.shape[0])
++            if indices is None:
++                queued = [tuple(routes.shape) for routes in self.replay_backward_list]
++                raise RuntimeError(
++                    "Router replay RECORD/REPLAY mismatch: this recompute has "
++                    f"{scores.shape[0]} token rows but no queued route tensor matches; queued={queued}. "
++                    "The recompute consumed routes of a different micro-batch, so the actor would silently "
++                    "train on the wrong experts."
++                )
+         else:
              return default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
  
          indices = indices.to(scores.device)
