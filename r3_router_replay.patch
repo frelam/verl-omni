@@ -1,0 +1,361 @@
+diff --git a/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py b/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
+index 19bf2a8c..59ed6dc7 100644
+--- a/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
++++ b/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
+@@ -404,6 +404,32 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
+     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+ 
+ 
++@pytest.mark.parametrize("routes_on_first_sample", [True, False])
++def test_agent_loop_postprocess_rejects_partial_routed_experts(routes_on_first_sample):
++    common = {
++        "output_prompt_ids": [101, 102],
++        "output_response_ids": [11, 12],
++        "output_response_mask": [1, 1],
++        "metrics": AgentLoopMetrics(),
++        "extra_fields": {},
++        "num_turns": 1,
++        "prompt_len": 2,
++        "response_len": 2,
++    }
++    first = _to_internal(**common)
++    second = _to_internal(**common)
++    routed_sample = first if routes_on_first_sample else second
++    routed_sample.routed_experts = torch.zeros(1, 4, 2, 2, dtype=torch.int16)
++    dummy_worker = type(
++        "_DummyWorker",
++        (),
++        {"reward_loop_worker_handles": None, "distillation_enabled": False},
++    )()
++
++    with pytest.raises(RuntimeError, match="either every sample or no sample"):
++        AgentLoopWorker._postprocess(dummy_worker, inputs=[first, second], input_non_tensor_batch={})
++
++
+ class _FakeTokenizerCustomPad:
+     """A minimal tokenizer with a non-zero pad_token_id for testing."""
+ 
+diff --git a/tests/utils/megatron/test_router_replay_model_walk_on_cpu.py b/tests/utils/megatron/test_router_replay_model_walk_on_cpu.py
+index aa89aa9f..347a12f6 100644
+--- a/tests/utils/megatron/test_router_replay_model_walk_on_cpu.py
++++ b/tests/utils/megatron/test_router_replay_model_walk_on_cpu.py
+@@ -135,3 +135,96 @@ def test_mtp_routers_are_not_addressed(orphans_then_model):
+ 
+     assert [ln for ln, _ in router_replay_utils.iter_model_routers(model)] == list(range(1, NUM_LAYERS + 1))
+     assert model.mtp[0].router_replay.router_replay_action is None
++
++
++def test_duplicate_replay_rows_fall_back_to_native_routing(monkeypatch):
++    monkeypatch.setattr(RouterReplay, "router_instances", [])
++    router = RouterReplay()
++    router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
++    targets = torch.tensor([[0, 0], [1, 1], [2, 3], [3, 1]], dtype=torch.int64)
++    replay_mask = torch.tensor([True, True, False, True])
++    router.set_target_indices(targets, replay_mask=replay_mask)
++    scores = torch.tensor(
++        [
++            [0.1, 0.2, 0.9, 0.8],
++            [0.9, 0.8, 0.2, 0.1],
++            [0.1, 0.9, 0.8, 0.2],
++            [0.8, 0.9, 0.1, 0.2],
++        ]
++    )
++
++    def native_topk(scores, topk, **_kwargs):
++        return torch.topk(scores, k=topk, dim=1)
++
++    _, indices = router.get_replay_topk(scores, 2, default_compute_topk=native_topk)
++    native_indices = native_topk(scores, 2).indices
++
++    # All-zero and partially duplicated targets cannot survive Megatron's bool
++    # routing_map without collapsing token assignments. Masked rows also stay native.
++    torch.testing.assert_close(indices[:3], native_indices[:3])
++    torch.testing.assert_close(indices[3], targets[3])
++    routing_map = torch.zeros_like(scores, dtype=torch.bool).scatter(1, indices, True)
++    assert routing_map.sum().item() == scores.shape[0] * 2
++
++
++def test_bshd_replay_matches_model_padding_and_sequence_parallel_layout(monkeypatch, tf_config):
++    monkeypatch.setattr(RouterReplay, "router_instances", [])
++    monkeypatch.setattr(router_replay_utils, "TopKRouter", FakeTopKRouter)
++    model = _build_model()
++    routes = torch.nested.as_nested_tensor(
++        [
++            torch.arange(3 * NUM_LAYERS * TOPK, dtype=torch.int16).reshape(3, NUM_LAYERS, TOPK),
++            100 + torch.arange(2 * NUM_LAYERS * TOPK, dtype=torch.int16).reshape(2, NUM_LAYERS, TOPK),
++        ],
++        layout=torch.jagged,
++    )
++    replay_mask = torch.nested.as_nested_tensor(
++        [torch.ones(3, dtype=torch.bool), torch.ones(2, dtype=torch.bool)], layout=torch.jagged
++    )
++    preprocess_calls = []
++
++    def fake_preprocess(value, **kwargs):
++        preprocess_calls.append(kwargs)
++        # Match preprocess_bshd_engine: forced_max_seqlen=5 is further aligned
++        # to six rows for two-way sequence parallelism.
++        padded_length = 6
++        dense_shape = tuple(value.shape[2:])
++        dense = torch.zeros((value.shape[0], padded_length, *dense_shape), dtype=value.dtype)
++        attention_mask = torch.zeros((value.shape[0], padded_length), dtype=torch.bool)
++        for index, part in enumerate(value.unbind()):
++            dense[index, : part.shape[0]] = part
++            attention_mask[index, : part.shape[0]] = True
++        return dense, attention_mask, None
++
++    monkeypatch.setattr(router_replay_utils, "preprocess_bshd_engine", fake_preprocess, raising=False)
++    monkeypatch.setattr(router_replay_utils, "device_name", "cpu")
++    # Sequence parallelism shards the sequence dimension, not the flattened batch dimension.
++    monkeypatch.setattr(router_replay_utils, "scatter_to_sequence_parallel_region", lambda value: value[:3])
++
++    router_replay_utils.set_router_replay_data(
++        routes,
++        attention_mask=None,
++        tf_config=tf_config,
++        replay_mask=replay_mask,
++        model=model,
++        data_format="bshd",
++        forced_max_seqlen=5,
++    )
++
++    dense_routes = fake_preprocess(routes)[0]
++    expected = dense_routes.transpose(0, 1)[:3].flatten(0, 1).permute(1, 0, 2)
++    for layer, module in enumerate(model):
++        torch.testing.assert_close(module.router_replay.target_topk_idx, expected[layer].to(torch.int64))
++        torch.testing.assert_close(
++            module.router_replay.target_replay_mask,
++            torch.tensor([True, True, True, True, True, False]),
++        )
++    assert [call["forced_max_seqlen"] for call in preprocess_calls[:2]] == [5, 5]
++
++
++def test_router_replay_accepts_native_mcore_mtp_constructor_arg(monkeypatch):
++    monkeypatch.setattr(RouterReplay, "router_instances", [])
++
++    router = RouterReplay(is_mtp_layer=True)
++
++    assert router.is_mtp_layer is True
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index d0e3038e..115826f8 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -1071,7 +1071,14 @@ class AgentLoopWorker:
+         optional_outputs = {}
+         if inputs[0].response_logprobs is not None:
+             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+-        if inputs[0].routed_experts is not None:
++        routed_experts_present = [input.routed_experts is not None for input in inputs]
++        if any(routed_experts_present) and not all(routed_experts_present):
++            raise RuntimeError(
++                "router replay requires routed_experts for either every sample or no sample in a batch; "
++                f"got presence flags {routed_experts_present}. Check that rollout routing capture is enabled "
++                "and returned routes for every sample."
++            )
++        if all(routed_experts_present):
+             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
+diff --git a/verl/utils/megatron/router_replay_patch.py b/verl/utils/megatron/router_replay_patch.py
+index a6940f9c..ec00c492 100644
+--- a/verl/utils/megatron/router_replay_patch.py
++++ b/verl/utils/megatron/router_replay_patch.py
+@@ -81,8 +81,11 @@ class RouterReplay:
+         for router in RouterReplay.router_instances:
+             router.clear_indices()
+ 
+-    def __init__(self):
++    def __init__(self, is_mtp_layer: bool = False):
+         """Initializes a RouterReplay instance for a specific layer."""
++        # Recent MCore constructs its replay objects with is_mtp_layer. Accept the
++        # same argument when verl supplies its implementation to native MCore routers.
++        self.is_mtp_layer = is_mtp_layer
+         self.target_topk_idx = None  # For replay
+         self.target_replay_mask = None
+         self.recorded_topk_idx = None  # For recording
+@@ -124,15 +127,26 @@ class RouterReplay:
+             return default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+ 
+         indices = indices.to(scores.device)
++        _, native_indices = default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
++        if indices.shape != native_indices.shape or (
++            replay_mask is not None and replay_mask.numel() != scores.shape[0]
++        ):
++            raise RuntimeError(
++                "Router replay tensors are not aligned: "
++                f"scores={tuple(scores.shape)}, targets={tuple(indices.shape)}, "
++                f"native={tuple(native_indices.shape)}, "
++                f"mask={None if replay_mask is None else tuple(replay_mask.shape)}"
++            )
++
++        # Zero-filled or otherwise missing rollout routes contain duplicate
++        # experts. Megatron's boolean routing_map collapses those duplicates,
++        # which can desynchronize permutation from the EP all-to-all splits.
++        # Such rows have no usable replay decision, so route them natively.
++        sorted_indices = indices.sort(dim=-1).values
++        valid_rows = (sorted_indices[:, 1:] != sorted_indices[:, :-1]).all(dim=-1)
+         if replay_mask is not None:
+-            _, native_indices = default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+-            if indices.shape != native_indices.shape or replay_mask.numel() != scores.shape[0]:
+-                raise RuntimeError(
+-                    "Router replay tensors are not aligned: "
+-                    f"scores={tuple(scores.shape)}, targets={tuple(indices.shape)}, "
+-                    f"native={tuple(native_indices.shape)}, mask={tuple(replay_mask.shape)}"
+-                )
+-            indices = torch.where(replay_mask.to(scores.device).bool().unsqueeze(-1), indices, native_indices)
++            valid_rows &= replay_mask.to(scores.device).bool().reshape(-1)
++        indices = torch.where(valid_rows.unsqueeze(-1), indices, native_indices)
+         return scores.gather(1, indices), indices
+ 
+     def clear_indices(self):
+diff --git a/verl/utils/megatron/router_replay_utils.py b/verl/utils/megatron/router_replay_utils.py
+index 8c027c58..be9b0e66 100644
+--- a/verl/utils/megatron/router_replay_utils.py
++++ b/verl/utils/megatron/router_replay_utils.py
+@@ -38,6 +38,7 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
+ from verl.models.mcore.util import (
+     postprocess_packed_seqs,
+     postprocess_thd_engine,
++    preprocess_bshd_engine,
+     preprocess_packed_seqs,
+     preprocess_thd_engine,
+ )
+@@ -439,6 +440,8 @@ def set_router_replay_data(
+     replay_mask=None,
+     local_cp_size=None,
+     model=None,
++    data_format=None,
++    forced_max_seqlen=None,
+ ):
+     """
+     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
+@@ -458,6 +461,9 @@ def set_router_replay_data(
+             unmasked tokens keep native Megatron routes.
+         model: The forwarded model (or list of VPP chunks). When given, targets are written to its own
+             routers instead of a positional slice of the global RouterReplay.router_instances list.
++        data_format: Model input layout. R3 passes "thd" or "bshd" explicitly; None preserves
++            the legacy layout inference for R2 callers.
++        forced_max_seqlen: Mini-batch-wide BSHD padding target used by the model forward.
+ 
+     Returns:
+         None: The function updates internal RouterReplay instances in-place.
+@@ -476,47 +482,74 @@ def set_router_replay_data(
+             else None
+         )
+ 
+-        replay_mask_rmpad = None
+-        if layers_topk_idx.is_nested:
+-            layers_topk_idx_rmpad, _, _ = preprocess_thd_engine(
++        replay_mask_rmpad_split = None
++        if data_format == "bshd":
++            if not layers_topk_idx.is_nested:
++                raise TypeError("R3 BSHD router replay requires jagged route targets")
++
++            # BSHD routers consume sequence-major [S, B] rows. Pad exactly like
++            # the model, transpose before the SP scatter, then restore that order.
++            layers_bshd, _, _ = preprocess_bshd_engine(
+                 layers_topk_idx,
+                 pre_process=True,
+                 use_fp8_padding=use_fp8_padding,
+-                min_local_rows=min_local_rows,
+-                local_cp_size=local_cp_size,
+-                cp_layout=cp_layout,
++                forced_max_seqlen=forced_max_seqlen,
+             )
++            layers_split = scatter_to_sequence_parallel_region(layers_bshd.transpose(0, 1).contiguous().to(device_name))
++            layers_topk_idx_reshape = layers_split.flatten(0, 1).permute(1, 0, 2)
+             if replay_mask is not None:
+-                replay_mask_rmpad, _, _ = preprocess_thd_engine(
++                if not replay_mask.is_nested:
++                    raise TypeError("R3 BSHD router replay requires a jagged replay mask")
++                mask_bshd, _, _ = preprocess_bshd_engine(
+                     replay_mask,
+                     pre_process=True,
+                     use_fp8_padding=use_fp8_padding,
++                    forced_max_seqlen=forced_max_seqlen,
++                )
++                replay_mask_rmpad_split = scatter_to_sequence_parallel_region(
++                    mask_bshd.transpose(0, 1).contiguous().to(device_name)
++                ).reshape(-1)
++        else:
++            replay_mask_rmpad = None
++            if layers_topk_idx.is_nested:
++                layers_topk_idx_rmpad, _, _ = preprocess_thd_engine(
++                    layers_topk_idx,
++                    pre_process=True,
++                    use_fp8_padding=use_fp8_padding,
+                     min_local_rows=min_local_rows,
+                     local_cp_size=local_cp_size,
+                     cp_layout=cp_layout,
+                 )
+-        else:
+-            if attention_mask is None:
+-                raise RuntimeError("router replay REPLAY requires attention_mask for non-nested BSHD inputs.")
+-            layers_topk_idx_rmpad, _ = preprocess_packed_seqs(
+-                layers_topk_idx, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding
+-            )
+-        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
+-
+-        # 1, dynamic_bs_split, layer_num, topk
+-        layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
+-            layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
+-        ).unsqueeze(dim=0)
+-        replay_mask_rmpad_split = None
+-        if replay_mask_rmpad is not None:
+-            replay_mask_rmpad_split = scatter_to_sequence_parallel_region(
+-                replay_mask_rmpad.to(device_name).squeeze(dim=0)
+-            )
++                if replay_mask is not None:
++                    replay_mask_rmpad, _, _ = preprocess_thd_engine(
++                        replay_mask,
++                        pre_process=True,
++                        use_fp8_padding=use_fp8_padding,
++                        min_local_rows=min_local_rows,
++                        local_cp_size=local_cp_size,
++                        cp_layout=cp_layout,
++                    )
++            else:
++                if attention_mask is None:
++                    raise RuntimeError("router replay REPLAY requires attention_mask for non-nested BSHD inputs.")
++                layers_topk_idx_rmpad, _ = preprocess_packed_seqs(
++                    layers_topk_idx, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding
++                )
++            layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
++
++            # 1, dynamic_bs_split, layer_num, topk
++            layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
++                layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
++            ).unsqueeze(dim=0)
++            if replay_mask_rmpad is not None:
++                replay_mask_rmpad_split = scatter_to_sequence_parallel_region(
++                    replay_mask_rmpad.to(device_name).squeeze(dim=0)
++                )
+ 
+-        # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
+-        layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
+-            dim=0
+-        )  # layer_num, dynamic_bs_all, topk
++            # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
++            layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
++                dim=0
++            )  # layer_num, dynamic_bs_all, topk
+         # When dim-0 covers all layers (e.g. R3, or R2 with all-MoE models),
+         # index by absolute layer_idx; otherwise (R2 with mixed dense/MoE),
+         # dim-0 only contains MoE layers, index by MoE-layer ordinal.
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index 01499e86..5f49721a 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -1324,6 +1324,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 replay_mask=replay_mask,
+                 local_cp_size=local_cp_size,
+                 model=unwrapped_model,
++                data_format=(
++                    ("thd" if self.engine_config.use_remove_padding else "bshd")
++                    if self.engine_config.router_replay.mode == "R3"
++                    else None
++                ),
++                forced_max_seqlen=tu.get_non_tensor_data(data=batch, key="forced_max_seqlen", default=None),
+             )
+ 
+         if pad_mode == DatasetPadMode.NO_PADDING:
