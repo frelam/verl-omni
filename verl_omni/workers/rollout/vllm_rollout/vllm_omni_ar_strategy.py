@@ -39,6 +39,11 @@ logger.setLevel(logging.INFO)
 
 _WORKER_EXTENSION = "verl_omni.workers.rollout.vllm_rollout.utils.vLLMOmniColocateWorkerExtension"
 
+# vLLM-Omni's AR schedulers drop MoE routes; R3 swaps in verl-omni's subclasses.
+_R3_SCHEDULER_MODULE = "verl_omni.workers.rollout.vllm_rollout.routed_experts_scheduler"
+_R3_SYNC_SCHEDULER = f"{_R3_SCHEDULER_MODULE}.R3ARScheduler"
+_R3_ASYNC_SCHEDULER = f"{_R3_SCHEDULER_MODULE}.R3ARAsyncScheduler"
+
 
 def _drop_none_mapping_values(value: Any) -> Any:
     if isinstance(value, dict):
@@ -108,6 +113,22 @@ class ARStrategy(OmniStrategyBase):
                     hf_overrides = json.loads(hf_overrides)
                 hf_overrides.update(adapter_overrides)
                 engine_kwargs["hf_overrides"] = hf_overrides
+
+        if self.server.config.enable_rollout_routing_replay:
+            # R3 needs every completion to carry the MoE routes the rollout actually
+            # used; only a single text-output AR stage owns the policy token sequence.
+            if self._rollout_output_modalities is not None:
+                raise ValueError(
+                    "enable_rollout_routing_replay requires a single-output AR pipeline, got final output "
+                    f"modalities {self._rollout_output_modalities}."
+                )
+            if engine_kwargs.get("scheduler_cls") is not None or engine_kwargs.get("scheduler-cls") is not None:
+                raise ValueError(
+                    "enable_rollout_routing_replay owns the vLLM-Omni scheduler because the built-in AR "
+                    "scheduler never returns routed experts; remove engine_kwargs.vllm_omni.scheduler_cls."
+                )
+            async_scheduling = engine_kwargs.get("async_scheduling", engine_kwargs.get("async-scheduling", True))
+            engine_kwargs["scheduler_cls"] = _R3_ASYNC_SCHEDULER if async_scheduling else _R3_SYNC_SCHEDULER
 
         stage_init_timeout = engine_kwargs.get("stage_init_timeout") or engine_kwargs.get("stage-init-timeout")
         init_timeout = engine_kwargs.get("init_timeout") or engine_kwargs.get("init-timeout")
@@ -416,10 +437,28 @@ class ARStrategy(OmniStrategyBase):
         stop_reason = self._map_stop_reason(finish_reason)
         num_preempted = self._extract_num_preempted(req_output)
 
+        routed_experts = None
+        if self.server.config.enable_rollout_routing_replay:
+            routed_experts = self._extract_routed_experts(req_output)
+
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
+            routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,
         )
+
+    @staticmethod
+    def _extract_routed_experts(req_output: Any) -> Any:
+        """Return the captured MoE routes, or fail if the engine omitted them."""
+        routes = getattr(req_output.outputs[0], "routed_experts", None)
+        if routes is None:
+            routes = getattr(req_output, "routed_experts", None)
+        if routes is None:
+            raise RuntimeError(
+                "enable_rollout_routing_replay is set, but the vLLM-Omni output carries no routed_experts; "
+                "ensure the engine received enable_return_routed_experts=True."
+            )
+        return routes

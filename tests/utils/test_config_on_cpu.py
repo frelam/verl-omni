@@ -153,3 +153,52 @@ def test_dynamic_resource_scheduling_raises_on_v1_entrypoints():
     config.async_training = {"use_dynamic_resource_scheduling": True}
     with pytest.raises(ValueError, match="hybrid_rollout.enable_switch"):
         validate_config(config)
+
+
+def _router_replay_config(
+    *, mode="disabled", capture=False, strategy="megatron", use_remove_padding=True, pad_to_length=False
+):
+    config = _config()
+    config.actor_rollout_ref = {
+        "actor": {
+            "strategy": strategy,
+            "megatron": {
+                "router_replay": {"mode": mode},
+                "use_remove_padding": use_remove_padding,
+                "pad_to_length": pad_to_length,
+            },
+        },
+        "rollout": {"enable_rollout_routing_replay": capture},
+    }
+    return config
+
+
+@pytest.mark.parametrize(("mode", "capture"), [("disabled", False), ("R2", False), ("R3", True)])
+def test_validate_config_admits_consistent_router_replay(mode, capture):
+    validate_config(_router_replay_config(mode=mode, capture=capture))
+
+
+def test_validate_config_r3_requires_rollout_capture():
+    with pytest.raises(ValueError, match="enable_rollout_routing_replay=true"):
+        validate_config(_router_replay_config(mode="R3", capture=False))
+
+
+@pytest.mark.parametrize("mode", ["disabled", "R2"])
+def test_validate_config_rollout_capture_requires_r3(mode):
+    with pytest.raises(ValueError, match="only consumed by"):
+        validate_config(_router_replay_config(mode=mode, capture=True))
+
+
+def test_validate_config_router_replay_requires_megatron():
+    with pytest.raises(ValueError, match="strategy='megatron'"):
+        validate_config(_router_replay_config(mode="R2", strategy="fsdp"))
+
+
+def test_validate_config_r3_requires_thd_packing():
+    with pytest.raises(ValueError, match="THD packing"):
+        validate_config(_router_replay_config(mode="R3", capture=True, use_remove_padding=False))
+
+
+def test_validate_config_r3_rejects_pad_to_length():
+    with pytest.raises(ValueError, match="pad_to_length"):
+        validate_config(_router_replay_config(mode="R3", capture=True, pad_to_length=True))
