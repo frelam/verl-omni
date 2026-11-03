@@ -19,14 +19,12 @@ import tempfile
 from argparse import Namespace
 from typing import Any, Optional
 
-import torch
 import yaml
-from packaging import version
 from verl.utils.device import get_visible_devices_keyword
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.vllm_rollout.utils import extract_prompt_logprobs
-from verl.workers.rollout.vllm_rollout.vllm_async_server import _VLLM_VERSION, vLLMHttpServer
+from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 from vllm import SamplingParams
 from vllm_omni.config.stage_config import StageExecutionType
 from vllm_omni.lora.request import LoRARequest
@@ -119,10 +117,6 @@ class ARStrategy(OmniStrategyBase):
         if self.server.config.enable_rollout_routing_replay:
             # R3 needs every completion to carry the MoE routes the rollout actually
             # used; only a single text-output AR stage owns the policy token sequence.
-            if _VLLM_VERSION < version.parse("0.22.0"):
-                raise RuntimeError(
-                    f"rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 (installed: {_VLLM_VERSION})."
-                )
             if self._rollout_output_modalities is not None:
                 raise ValueError(
                     "enable_rollout_routing_replay requires a single-output AR pipeline, got final output "
@@ -135,7 +129,6 @@ class ARStrategy(OmniStrategyBase):
                 )
             async_scheduling = engine_kwargs.get("async_scheduling", engine_kwargs.get("async-scheduling", True))
             engine_kwargs["scheduler_cls"] = _R3_ASYNC_SCHEDULER if async_scheduling else _R3_SYNC_SCHEDULER
-            engine_kwargs["enable_return_routed_experts"] = True
 
         stage_init_timeout = engine_kwargs.get("stage_init_timeout") or engine_kwargs.get("stage-init-timeout")
         init_timeout = engine_kwargs.get("init_timeout") or engine_kwargs.get("init-timeout")
@@ -458,22 +451,8 @@ class ARStrategy(OmniStrategyBase):
         )
 
     @staticmethod
-    def _extract_routed_experts(req_output: Any) -> torch.Tensor:
-        """Return the MoE routes used by the rollout as an int16 ``[tokens, layers, topk]`` tensor.
-
-        vLLM records routes for every forward token, so the prompt and the generated
-        tokens up to the final one are covered; the training engine pads the missing
-        final row itself.
-
-        Args:
-            req_output: Final vLLM-Omni request output for one generation.
-
-        Returns:
-            The per-token, per-layer, per-expert route indices.
-
-        Raises:
-            RuntimeError: When the engine returned no routes despite the feature being on.
-        """
+    def _extract_routed_experts(req_output: Any) -> Any:
+        """Return the captured MoE routes, or fail if the engine omitted them."""
         routes = getattr(req_output.outputs[0], "routed_experts", None)
         if routes is None:
             routes = getattr(req_output, "routed_experts", None)
@@ -482,4 +461,4 @@ class ARStrategy(OmniStrategyBase):
                 "enable_rollout_routing_replay is set, but the vLLM-Omni output carries no routed_experts; "
                 "ensure the engine received enable_return_routed_experts=True."
             )
-        return torch.as_tensor(routes).to(device="cpu", dtype=torch.int16)
+        return routes

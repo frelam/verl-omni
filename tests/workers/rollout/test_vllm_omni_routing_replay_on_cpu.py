@@ -18,17 +18,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
-from packaging import version
 
-from verl_omni.workers.rollout.vllm_rollout import vllm_omni_ar_strategy
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import ARStrategy
-
-
-@pytest.fixture(autouse=True)
-def _supported_vllm(monkeypatch):
-    """Pin a supported vLLM: the CPU stub reports 0.0.0 while CI installs the real wheel."""
-    monkeypatch.setattr(vllm_omni_ar_strategy, "_VLLM_VERSION", version.parse("0.28.0"))
 
 
 def _strategy(*, capture: bool, output_modalities=None) -> ARStrategy:
@@ -37,12 +28,6 @@ def _strategy(*, capture: bool, output_modalities=None) -> ARStrategy:
     strategy.server.global_steps = 0
     strategy._rollout_output_modalities = output_modalities
     return strategy
-
-
-def test_preprocess_engine_kwargs_requests_routed_experts():
-    engine_kwargs: dict = {}
-    _strategy(capture=True).preprocess_engine_kwargs(engine_kwargs)
-    assert engine_kwargs["enable_return_routed_experts"] is True
 
 
 def test_preprocess_engine_kwargs_installs_the_r3_async_scheduler():
@@ -69,12 +54,6 @@ def test_preprocess_engine_kwargs_untouched_when_disabled():
     assert "scheduler_cls" not in engine_kwargs
 
 
-def test_preprocess_engine_kwargs_requires_supported_vllm(monkeypatch):
-    monkeypatch.setattr(vllm_omni_ar_strategy, "_VLLM_VERSION", version.parse("0.21.0"))
-    with pytest.raises(RuntimeError, match="vLLM >= 0.22.0"):
-        _strategy(capture=True).preprocess_engine_kwargs({})
-
-
 def test_preprocess_engine_kwargs_rejects_multi_output_pipeline():
     with pytest.raises(ValueError, match="single-output"):
         _strategy(capture=True, output_modalities=["text", "audio"]).preprocess_engine_kwargs({})
@@ -85,14 +64,12 @@ def _request_output(**completion_fields) -> SimpleNamespace:
     return SimpleNamespace(outputs=[completion])
 
 
-def test_process_output_carries_routes_as_int16_tensor():
+def test_process_output_passes_routes_through_without_conversion():
     routes = np.arange(2 * 3 * 2, dtype=np.int32).reshape(2, 3, 2) % 8
     output = _strategy(capture=True).process_output(
         _request_output(routed_experts=routes), SimpleNamespace(logprobs=None), {}
     )
-    assert output.routed_experts is not None
-    assert output.routed_experts.dtype == torch.int16
-    assert torch.equal(output.routed_experts, torch.as_tensor(routes).to(torch.int16))
+    assert output.routed_experts is routes
 
 
 def test_process_output_omits_routes_when_disabled():

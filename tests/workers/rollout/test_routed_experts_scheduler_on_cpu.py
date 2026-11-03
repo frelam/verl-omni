@@ -17,13 +17,8 @@
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
-from verl_omni.workers.rollout.vllm_rollout.routed_experts_scheduler import (
-    R3ARAsyncScheduler,
-    _RoutedExpertsARSchedulerMixin,
-    verify_routed_experts_engine,
-)
+from verl_omni.workers.rollout.vllm_rollout.routed_experts_scheduler import _RoutedExpertsARSchedulerMixin
 
 
 def _routes(rows: int) -> np.ndarray:
@@ -189,25 +184,3 @@ def test_capture_disabled_is_a_pass_through():
 
     assert scheduler.routed_experts_mgr.stored == []
     assert outputs[0].outputs[0].routed_experts is None
-
-
-def _engine(*, enabled: bool, scheduler_cls: type) -> SimpleNamespace:
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(enable_return_routed_experts=enabled),
-        scheduler_config=SimpleNamespace(get_scheduler_cls=lambda: scheduler_cls),
-    )
-    return SimpleNamespace(engine=SimpleNamespace(stage_vllm_configs=[vllm_config]))
-
-
-def test_verify_engine_accepts_the_r3_scheduler():
-    verify_routed_experts_engine(_engine(enabled=True, scheduler_cls=R3ARAsyncScheduler))
-
-
-def test_verify_engine_rejects_a_scheduler_without_route_support():
-    with pytest.raises(RuntimeError, match="drops routed experts"):
-        verify_routed_experts_engine(_engine(enabled=True, scheduler_cls=type("OtherScheduler", (), {})))
-
-
-def test_verify_engine_rejects_an_engine_without_capture():
-    with pytest.raises(RuntimeError, match="enable_return_routed_experts"):
-        verify_routed_experts_engine(_engine(enabled=False, scheduler_cls=R3ARAsyncScheduler))

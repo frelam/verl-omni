@@ -620,6 +620,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.enable_routing_replay = (
             self.config.actor.strategy == "megatron" and self.config.actor.megatron.router_replay.mode != "disabled"
         )
+        if self.enable_routing_replay and self.config.actor.megatron.router_replay.mode == "R3":
+            from verl_omni.workers.engine.router_replay_compat import install_r3_router_replay_compat
+
+            install_r3_router_replay_compat()
 
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)

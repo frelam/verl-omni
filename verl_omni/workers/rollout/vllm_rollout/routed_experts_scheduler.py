@@ -120,31 +120,3 @@ class R3ARScheduler(_RoutedExpertsARSchedulerMixin, OmniARScheduler):
 
 class R3ARAsyncScheduler(_RoutedExpertsARSchedulerMixin, OmniARAsyncScheduler):
     """Async-scheduling omni AR scheduler carrying MoE routes."""
-
-
-def verify_routed_experts_engine(engine: Any) -> None:
-    """Fail fast when the rollout engine is not wired to return MoE routes.
-
-    Args:
-        engine: The ``AsyncOmni`` client created by the rollout server.
-
-    Raises:
-        RuntimeError: When a stage did not receive ``enable_return_routed_experts``
-            or still runs a scheduler that drops the routes.
-    """
-    stage_configs = getattr(getattr(engine, "engine", None), "stage_vllm_configs", None) or []
-    for stage_id, vllm_config in enumerate(stage_configs):
-        if vllm_config is None:
-            continue
-        if not getattr(vllm_config.model_config, "enable_return_routed_experts", False):
-            raise RuntimeError(
-                f"R3 router replay is on, but stage {stage_id} did not receive enable_return_routed_experts=True; "
-                "the rollout engine would never return routed experts."
-            )
-        scheduler_cls = vllm_config.scheduler_config.get_scheduler_cls()
-        if not issubclass(scheduler_cls, _RoutedExpertsARSchedulerMixin):
-            raise RuntimeError(
-                f"R3 router replay is on, but stage {stage_id} runs scheduler {scheduler_cls!r}; "
-                "vLLM-Omni's built-in AR scheduler drops routed experts, so the rollout must use "
-                f"{R3ARAsyncScheduler.__module__}.{R3ARAsyncScheduler.__qualname__}."
-            )
