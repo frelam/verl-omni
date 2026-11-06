@@ -15,9 +15,9 @@
 """Geo3K reward with a degenerate-repetition guard.
 
 Reuses verl's built-in ``hiyouga/geometry3k`` scorer (90% answer accuracy +
-10% strict ``<think>...</think>\\boxed{...}`` format) and zeroes the whole
-trajectory when the response is stuck in a repetition loop, even if the boxed
-answer happens to match.
+10% strict ``<think>...</think>\\boxed{...}`` format) and zeroes the content
+score when the response is stuck in a repetition loop, even if the boxed
+answer happens to match. The format score is judged as usual.
 
 Config:
     reward.custom_reward_function.path=verl_omni/utils/reward_score/geo3k_reward.py
@@ -63,13 +63,13 @@ def compute_score(
     format_score: float = 0.1,
     **kwargs,
 ) -> float:
-    """Score one Geo3K response, returning 0.0 for repetition loops.
+    """Score one Geo3K response, zeroing only the content score for repetition loops.
+
+    The format score is still awarded normally, so a looping response can score
+    at most ``format_score``.
 
     Extra ``data_source`` / ``extra_info`` kwargs are accepted because verl's
     reward managers pass them to every custom reward function.
     """
-    if has_repetition(solution_str):
-        return 0.0
-    return (1.0 - format_score) * acc_reward(solution_str, ground_truth, use_boxed) + format_score * format_reward(
-        solution_str
-    )
+    acc = 0.0 if has_repetition(solution_str) else acc_reward(solution_str, ground_truth, use_boxed)
+    return (1.0 - format_score) * acc + format_score * format_reward(solution_str)
